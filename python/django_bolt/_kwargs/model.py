@@ -15,6 +15,8 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
+from .extractors import create_extractor_for_field
+from .runtime import extract_parameter_value, extract_path_params
 from ..dependencies import resolve_dependency
 from ..params import Depends as DependsMarker
 from ..params import Param
@@ -27,8 +29,6 @@ from ..typing import (
     unwrap_optional,
 )
 from ..websocket import WebSocket as WebSocketType
-from .extractors import create_extractor_for_field
-from .runtime import extract_parameter_value, extract_path_params
 
 
 def extract_response_metadata(response_type: Any) -> dict[str, Any]:
@@ -81,7 +81,7 @@ def field_has_upload_file(field: FieldDefinition) -> bool:
 
 
 def classify_handler_pattern(
-    fields: list[FieldDefinition], meta: HandlerMetadata, needs_form_parsing: bool
+        fields: list[FieldDefinition], meta: HandlerMetadata, needs_form_parsing: bool
 ) -> HandlerPattern:
     """
     Classify handler into a pattern for specialized injector selection.
@@ -334,7 +334,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
 
         # Skip WebSocket parameter - it's injected by Rust
         if base_annotation is WebSocketType or (
-            isinstance(base_annotation, type) and issubclass(base_annotation, WebSocketType)
+                isinstance(base_annotation, type) and issubclass(base_annotation, WebSocketType)
         ):
             continue
 
@@ -402,10 +402,10 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
 
 
 async def build_handler_arguments(
-    meta: HandlerMetadata,
-    request: dict[str, Any],
-    handler_meta_dict: dict[int, HandlerMetadata],
-    compile_binder_fn: Callable,
+        meta: HandlerMetadata,
+        request: dict[str, Any],
+        handler_meta_dict: dict[int, HandlerMetadata],
+        compile_binder_fn: Callable,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Build arguments for handler invocation."""
     args: list[Any] = []
@@ -488,9 +488,9 @@ def _injector_no_params(request: Any) -> tuple[tuple[()], dict[str, Any]]:
 
 
 def compile_argument_injector(
-    meta: HandlerMetadata,
-    handler_meta_dict: dict[int, HandlerMetadata],
-    compile_binder_fn: Callable,
+        meta: HandlerMetadata,
+        handler_meta_dict: dict[int, HandlerMetadata],
+        compile_binder_fn: Callable,
 ) -> Callable[[dict[str, Any]], tuple[list[Any], dict[str, Any]]]:
     """
     Compile a specialized argument injector function for a handler.
@@ -524,7 +524,6 @@ def compile_argument_injector(
 
     # Fast path 1: Request-only mode (single request parameter)
     if mode == "request_only":
-
         def injector_request_only(request: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
             return ([request], {})
 
