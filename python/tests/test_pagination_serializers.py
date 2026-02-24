@@ -8,6 +8,7 @@ or return type annotation for efficient batch serialization.
 from __future__ import annotations
 
 import asyncio
+import builtins
 
 import msgspec
 import pytest
@@ -596,7 +597,7 @@ def test_viewset_pagination_with_return_type_serializer(sample_articles):
         queryset = Article.objects.all()
 
         @paginate(SmallPagePagination)
-        async def list(self, request) -> list[ArticleListSerializer]:
+        async def list(self, request) -> builtins.list[ArticleListSerializer]:
             return await self.get_queryset()
 
     with TestClient(api) as client:
