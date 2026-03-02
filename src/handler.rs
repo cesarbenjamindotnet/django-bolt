@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use futures_util::StreamExt;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedBytes;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
@@ -33,6 +34,20 @@ use crate::state::{find_asgi_mount, AppState, GLOBAL_ROUTER, ROUTE_METADATA, TAS
 use crate::streaming::{create_python_stream, create_sse_stream};
 use crate::type_coercion::{params_to_py_dict, CoercedValue};
 use crate::validation::{parse_cookies_inline, validate_auth_and_guards, AuthGuardResult};
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// Result of the unified dispatch block.
+/// Sync-eligible routes return Ready (no async bridge overhead).
+/// Async routes return Pending (existing coroutine + future path).
+enum DispatchOutcome {
+    Ready(HttpResponse),
+    /// Sync dispatch completed but body requires async post-processing (stream/file).
+    /// Carries the already-parsed wire to avoid re-acquiring GIL and re-parsing.
+    SyncResult(ParsedResponseWire),
+    Pending(Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>),
+}
 
 // Cache Python classes for type construction (avoids repeated imports)
 static UUID_CLASS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -357,6 +372,9 @@ pub fn form_result_to_py(
 
 enum ResponseWireBody {
     Bytes(Vec<u8>),
+    /// Zero-copy path: PyBackedBytes holds a reference to the Python bytes object.
+    /// bytes::Bytes::from_owner wraps it directly — no memcpy at any point.
+    ZeroCopyBytes(PyBackedBytes),
     FilePath(String),
     Stream {
         media_type: String,
@@ -365,9 +383,26 @@ enum ResponseWireBody {
     },
 }
 
+enum MetaRef {
+    /// Fast path: static reference from integer tag (no allocation)
+    Static(&'static ResponseMeta),
+    /// Slow path: parsed from Python tuple (custom headers/cookies)
+    Owned(ResponseMeta),
+}
+
+impl MetaRef {
+    #[inline]
+    fn as_ref(&self) -> &ResponseMeta {
+        match self {
+            MetaRef::Static(s) => s,
+            MetaRef::Owned(o) => o,
+        }
+    }
+}
+
 struct ParsedResponseWire {
     status: StatusCode,
-    meta: ResponseMeta,
+    meta: MetaRef,
     body: ResponseWireBody,
 }
 
@@ -382,20 +417,41 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
 
     let status_code: u16 = tuple.get_item(0)?.extract()?;
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-    let meta = ResponseMeta::from_python(&tuple.get_item(1)?)?;
-    let body_kind: String = tuple.get_item(2)?.extract()?;
+    // Fast path: integer meta tag maps to static ResponseMeta (no String alloc, no tuple parse).
+    // Slow path: parse full tuple for responses with custom headers/cookies.
+    let meta_item = tuple.get_item(1)?;
+    let meta = if let Ok(tag) = meta_item.extract::<u8>() {
+        match ResponseMeta::from_tag(tag) {
+            Some(static_meta) => MetaRef::Static(static_meta),
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown response meta tag: {}",
+                    tag
+                )))
+            }
+        }
+    } else {
+        MetaRef::Owned(ResponseMeta::from_python(&meta_item)?)
+    };
+    // body_kind is an integer tag: 0=bytes, 1=stream, 2=file (avoids String alloc per response)
+    let body_kind: u8 = tuple.get_item(2)?.extract()?;
     let payload = tuple.get_item(3)?;
 
-    let body = match body_kind.as_str() {
-        "bytes" => {
-            if let Ok(py_bytes) = payload.cast::<PyBytes>() {
-                ResponseWireBody::Bytes(py_bytes.as_bytes().to_vec())
+    // body_kind integer tags must match Python's _BODY_BYTES/STREAM/FILE in serialization.py:
+    //   0 = bytes, 1 = stream, 2 = file
+    let body = match body_kind {
+        0 => {
+            // Zero-copy path: PyBackedBytes holds a Python reference + slice pointer.
+            // No memcpy here. bytes::Bytes::from_owner (outside GIL) wraps it directly.
+            if let Ok(backed) = payload.extract::<PyBackedBytes>() {
+                ResponseWireBody::ZeroCopyBytes(backed)
             } else {
+                // Fallback for non-bytes payloads (uncommon).
                 ResponseWireBody::Bytes(payload.extract::<Vec<u8>>()?)
             }
         }
-        "file" => ResponseWireBody::FilePath(payload.extract::<String>()?),
-        "stream" => {
+        1 => {
+            // stream
             let streaming_cls = get_streaming_response_class(py);
             if !payload.is_instance(streaming_cls.bind(py))? {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -418,6 +474,7 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
                 is_async_generator,
             }
         }
+        2 => ResponseWireBody::FilePath(payload.extract::<String>()?), // file
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unsupported response body kind: {}",
@@ -438,66 +495,68 @@ fn mark_skip_cors(response: &mut HttpResponse, skip_cors: bool) {
     }
 }
 
-pub async fn response_from_wire_result(
-    result_obj: Py<PyAny>,
+/// Build HttpResponse from an already-parsed wire result.
+/// Shared by both sync-result fallback (stream/file from trivially-async) and async path.
+async fn build_response_from_parsed(
+    parsed: ParsedResponseWire,
     skip_compression: bool,
     skip_cors: bool,
     is_head_request: bool,
-) -> PyResult<HttpResponse> {
-    let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
+) -> HttpResponse {
+    let meta_ref = parsed.meta.as_ref();
 
     match parsed.body {
         ResponseWireBody::Bytes(body_bytes) => {
-            let response_body = if is_head_request {
-                Vec::new()
-            } else {
-                body_bytes
-            };
+            let body = if is_head_request { Vec::new() } else { body_bytes };
             let mut response = response_builder::build_response_from_meta(
-                parsed.status,
-                parsed.meta,
-                response_body,
-                skip_compression,
+                parsed.status, meta_ref, body, skip_compression,
             );
             mark_skip_cors(&mut response, skip_cors);
-            Ok(response)
+            response
+        }
+        ResponseWireBody::ZeroCopyBytes(backed) => {
+            let body = if is_head_request {
+                drop(backed);
+                Bytes::new()
+            } else {
+                Bytes::from_owner(backed)
+            };
+            let mut response = response_builder::build_response_from_meta(
+                parsed.status, meta_ref, body, skip_compression,
+            );
+            mark_skip_cors(&mut response, skip_cors);
+            response
         }
         ResponseWireBody::FilePath(file_path) => {
-            let headers = response_builder::meta_to_headers(&parsed.meta);
+            let headers = response_builder::meta_to_headers(meta_ref);
             let mut response = build_file_response(
-                &file_path,
-                parsed.status,
-                headers,
-                skip_compression,
-                is_head_request,
+                &file_path, parsed.status, headers, skip_compression, is_head_request,
             )
             .await;
             mark_skip_cors(&mut response, skip_cors);
-            Ok(response)
+            response
         }
         ResponseWireBody::Stream {
             media_type,
             content_obj,
             is_async_generator,
         } => {
-            let headers = response_builder::meta_to_headers(&parsed.meta);
+            let headers = response_builder::meta_to_headers(meta_ref);
             if media_type == "text/event-stream" {
                 if is_head_request {
                     let mut response = response_builder::build_sse_response(
-                        parsed.status,
-                        headers,
-                        skip_compression,
+                        parsed.status, headers, skip_compression,
                     )
                     .body(Vec::<u8>::new());
                     mark_skip_cors(&mut response, skip_cors);
-                    return Ok(response);
+                    return response;
                 }
                 let stream = create_sse_stream(content_obj, is_async_generator);
                 let mut response =
                     response_builder::build_sse_response(parsed.status, headers, skip_compression)
                         .streaming(stream);
                 mark_skip_cors(&mut response, skip_cors);
-                return Ok(response);
+                return response;
             }
 
             let mut builder = HttpResponse::build(parsed.status);
@@ -510,7 +569,7 @@ pub async fn response_from_wire_result(
                 }
                 let mut response = builder.body(Vec::<u8>::new());
                 mark_skip_cors(&mut response, skip_cors);
-                return Ok(response);
+                return response;
             }
             if skip_compression {
                 builder.append_header(("Content-Encoding", "identity"));
@@ -518,9 +577,19 @@ pub async fn response_from_wire_result(
             let stream = create_python_stream(content_obj, is_async_generator);
             let mut response = builder.streaming(stream);
             mark_skip_cors(&mut response, skip_cors);
-            Ok(response)
+            response
         }
     }
+}
+
+pub async fn response_from_wire_result(
+    result_obj: Py<PyAny>,
+    skip_compression: bool,
+    skip_cors: bool,
+    is_head_request: bool,
+) -> PyResult<HttpResponse> {
+    let parsed = Python::attach(|py| parse_response_wire(py, &result_obj))?;
+    Ok(build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await)
 }
 
 /// Build prebound Python args/kwargs from Rust binding metadata.
@@ -680,10 +749,11 @@ pub async fn handle_request(
         .get()
         .and_then(|meta_map| meta_map.get(handler_id));
 
-    // Optimization: Only parse query string if handler needs it
-    // This saves ~0.5-1ms per request for handlers that don't use query params
-    let needs_query = route_metadata.map(|m| m.plan.needs_query()).unwrap_or(true);
+    // OPTIMIZATION: Extract the execution plan bitfield once (Copy u16).
+    // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.
+    let plan = route_metadata.map(|m| m.plan);
 
+    let needs_query = plan.map_or(true, |p| p.needs_query());
     let query_params = if needs_query {
         if let Some(q) = req.uri().query() {
             parse_query_string(q)
@@ -694,12 +764,9 @@ pub async fn handle_request(
         AHashMap::new()
     };
 
-    // Optimization: Skip body buffering for handlers that never read body/form/file params.
-    let needs_body = route_metadata.map(|m| m.plan.needs_body()).unwrap_or(true);
+    let needs_body = plan.map_or(true, |p| p.needs_body());
 
     // Type validation for path and query parameters (Rust-native, no GIL)
-    // This validates parameter types before GIL acquisition, returning 422 for invalid types.
-    // It also caches non-string coerced values so we can avoid re-parsing during Python dict build.
     let (path_coerced, query_coerced): (
         AHashMap<String, CoercedValue>,
         AHashMap<String, CoercedValue>,
@@ -713,34 +780,19 @@ pub async fn handle_request(
         (AHashMap::new(), AHashMap::new())
     };
 
-    // Optimization: Check if handler needs headers
-    // Headers are still needed for auth/rate limiting middleware, so we extract them for Rust
-    // but can skip passing them to Python when the handler doesn't use Header() params
-    let needs_headers = route_metadata
-        .map(|m| m.plan.needs_headers())
-        .unwrap_or(true);
-
-    // Extract request headers only when needed by auth/rate-limit/cookies/form/Python path params.
-    let needs_cookies = route_metadata
-        .map(|m| m.plan.needs_cookies())
-        .unwrap_or(true);
-    let needs_form_parsing = route_metadata
-        .map(|m| m.plan.needs_form_parsing())
-        .unwrap_or(false);
-    let has_route_auth_or_guards = route_metadata
-        .map(|m| m.plan.has_auth_or_guards())
-        .unwrap_or(false);
-    let has_route_rate_limit = route_metadata
-        .map(|m| m.plan.has_rate_limit())
-        .unwrap_or(false);
+    let needs_headers = plan.map_or(true, |p| p.needs_headers());
+    let needs_cookies = plan.map_or(true, |p| p.needs_cookies());
+    let needs_form_parsing = plan.map_or(false, |p| p.needs_form_parsing());
+    let has_route_auth_or_guards = plan.map_or(false, |p| p.has_auth_or_guards());
+    let has_route_rate_limit = plan.map_or(false, |p| p.has_rate_limit());
     let must_extract_headers = needs_headers
         || needs_cookies
         || needs_form_parsing
         || has_route_auth_or_guards
         || has_route_rate_limit;
-
-    // Compute skip_cors flag for CorsMiddleware
-    let skip_cors = route_metadata.map(|m| m.plan.skip_cors()).unwrap_or(false);
+    let skip_cors = plan.map_or(false, |p| p.skip_cors());
+    let skip_compression = plan.map_or(false, |p| p.skip_compression());
+    let can_sync_dispatch = plan.map_or(false, |p| p.can_sync_dispatch());
 
     // Extract and validate headers
     let headers = if must_extract_headers {
@@ -754,20 +806,6 @@ pub async fn handle_request(
 
     // Get peer address for rate limiting fallback
     let peer_addr = req.peer_addr().map(|addr| addr.ip().to_string());
-
-    // Get connection info from Actix - handles proxies, IPv6, etc. correctly
-    let conn_info = req.connection_info();
-    let conn_host = conn_info.host().to_owned();
-    let conn_scheme = conn_info.scheme().to_owned();
-    let conn_remote_addr = conn_info
-        .realip_remote_addr()
-        .unwrap_or("127.0.0.1")
-        .to_owned();
-
-    // Compute skip flags (e.g., skip compression)
-    let skip_compression = route_metadata
-        .map(|m| m.plan.skip_compression())
-        .unwrap_or(false);
 
     // Process rate limiting (Rust-native, no GIL)
     if let Some(route_meta) = route_metadata {
@@ -809,6 +847,29 @@ pub async fn handle_request(
         parse_cookies_inline(headers.get("cookie").map(|s| s.as_str()))
     } else {
         AHashMap::new()
+    };
+
+    // Derive connection info from already-extracted headers (avoids a second header-parse pass).
+    // conn_info is only used for request.META (Django templates) and build_absolute_uri().
+    // When headers weren't extracted (pure API routes with no auth/cookies/middleware),
+    // empty strings are safe because no Django middleware will call META anyway.
+    let (conn_host, conn_scheme, conn_remote_addr) = if must_extract_headers {
+        let host = headers.get("host").cloned().unwrap_or_default();
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+        // X-Forwarded-For: leftmost IP is the original client (RFC 7239 §7.1)
+        let remote_addr = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+            .or_else(|| headers.get("x-real-ip").cloned())
+            .or_else(|| peer_addr.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        (host, scheme, remote_addr)
+    } else {
+        // No headers extracted → no Django middleware → META won't be accessed
+        (String::new(), String::new(), String::new())
     };
 
     // Determine if form parsing is needed and get content type
@@ -904,12 +965,10 @@ pub async fn handle_request(
     // Check if this is a HEAD request (needed for body stripping after Python handler)
     let is_head_request = method == "HEAD";
 
-    // All handlers (sync and async) go through async dispatch path
-    // Sync handlers are executed in thread pool via sync_to_thread() in Python layer
+    // Unified GIL block: build request + dispatch (sync or async)
     // OPTIMIZATION: Single GIL acquisition for handler clone + dispatch call
-    let fut = match Python::attach(|py| -> PyResult<_> {
+    let dispatch_result: Result<DispatchOutcome, PyErr> = Python::attach(|py| {
         let handler = route_handler.clone_ref(py);
-        let dispatch = state.dispatch.clone_ref(py);
 
         // Create context dict only if auth context is present
         let context = if let Some(ref auth) = auth_ctx {
@@ -951,9 +1010,15 @@ pub async fn handle_request(
         } else {
             PyDict::new(py)
         };
-        let cookies_dict = params_to_py_dict(py, &cookies, param_types)?;
+        let cookies_dict = if needs_cookies {
+            params_to_py_dict(py, &cookies, param_types)?
+        } else {
+            PyDict::new(py)
+        };
 
-        let state_dict = PyDict::new(py);
+        // Only create state dict when Rust-side prebound args exist.
+        // For fast-path handlers (no rust_arg_bindings), state is lazily allocated on first access.
+        let state_lock = std::sync::OnceLock::new();
         if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
             if let Some((pre_args, pre_kwargs)) = build_prebound_args_kwargs(
                 py,
@@ -963,16 +1028,19 @@ pub async fn handle_request(
                 &headers_dict,
                 &cookies_dict,
             ) {
+                let state_dict = PyDict::new(py);
                 state_dict.set_item("_bolt_prebound_args", pre_args)?;
                 state_dict.set_item("_bolt_prebound_kwargs", pre_kwargs)?;
+                let _ = state_lock.set(state_dict.unbind());
             }
         }
 
-        // Create form_map and files_map from form parsing result
-        let (form_map_dict, files_map_dict) = if let Some(ref result) = form_result {
-            form_result_to_py(py, result)?
+        // Only create form/files dicts when form data is present (saves 2 allocs per request).
+        let (form_map_opt, files_map_opt) = if let Some(ref result) = form_result {
+            let (fm, fi) = form_result_to_py(py, result)?;
+            (Some(fm), Some(fi))
         } else {
-            (PyDict::new(py).unbind(), PyDict::new(py).unbind())
+            (None, None)
         };
 
         let request = PyRequest {
@@ -985,9 +1053,9 @@ pub async fn handle_request(
             cookies: cookies_dict.unbind(),
             context,
             user: None,
-            state: state_dict.unbind(), // State dict for middleware and dynamic attributes
-            form_map: form_map_dict,
-            files_map: files_map_dict,
+            state: state_lock,
+            form_map: form_map_opt,
+            files_map: files_map_opt,
             meta_cache: std::sync::OnceLock::new(),
             conn_host: conn_host.clone(),
             conn_scheme: conn_scheme.clone(),
@@ -995,48 +1063,110 @@ pub async fn handle_request(
         };
         let request_obj = Py::new(py, request)?;
 
-        // Reuse the global event loop locals initialized at server startup
-        let locals = TASK_LOCALS.get().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
-        })?;
-
-        // Call dispatch (always returns a coroutine since _dispatch is async)
-        let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
-        pyo3_async_runtimes::into_future_with_locals(locals, coroutine.into_bound(py))
-    }) {
-        Ok(f) => f,
-        Err(e) => {
-            return Python::attach(|py| {
-                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
-            });
+        if can_sync_dispatch {
+            // SYNC PATH: Call dispatch_sync directly → returns tuple (not coroutine).
+            // Parse response wire and build HTTP response in the same GIL block.
+            // Eliminates: coroutine creation, into_future_with_locals, asyncio polling.
+            let result_obj =
+                state
+                    .dispatch_sync
+                    .call1(py, (handler, request_obj, handler_id))?;
+            let parsed = parse_response_wire(py, &result_obj)?;
+            let meta_ref = parsed.meta.as_ref();
+            let response = match parsed.body {
+                ResponseWireBody::ZeroCopyBytes(backed) => {
+                    let body = if is_head_request {
+                        drop(backed);
+                        Bytes::new()
+                    } else {
+                        Bytes::from_owner(backed)
+                    };
+                    let mut resp = response_builder::build_response_from_meta(
+                        parsed.status,
+                        meta_ref,
+                        body,
+                        skip_compression,
+                    );
+                    mark_skip_cors(&mut resp, skip_cors);
+                    resp
+                }
+                ResponseWireBody::Bytes(body_bytes) => {
+                    let body = if is_head_request {
+                        Vec::new()
+                    } else {
+                        body_bytes
+                    };
+                    let mut resp = response_builder::build_response_from_meta(
+                        parsed.status,
+                        meta_ref,
+                        body,
+                        skip_compression,
+                    );
+                    mark_skip_cors(&mut resp, skip_cors);
+                    resp
+                }
+                // Stream/file body: sync dispatch ran the handler but the response
+                // needs async processing (e.g. StreamingResponse from a trivially-async handler).
+                // Pass the already-parsed wire to avoid re-acquiring GIL and re-parsing.
+                _ => {
+                    return Ok(DispatchOutcome::SyncResult(parsed));
+                }
+            };
+            Ok(DispatchOutcome::Ready(response))
+        } else {
+            // ASYNC PATH: Create coroutine + future (existing behavior)
+            let dispatch = state.dispatch.clone_ref(py);
+            let locals = TASK_LOCALS.get().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized")
+            })?;
+            let coroutine = dispatch.call1(py, (handler, request_obj, handler_id))?;
+            let fut = pyo3_async_runtimes::into_future_with_locals(
+                locals,
+                coroutine.into_bound(py),
+            )?;
+            Ok(DispatchOutcome::Pending(Box::pin(fut)))
         }
-    };
+    });
 
-    match fut.await {
-        Ok(result_obj) => match response_from_wire_result(
-            result_obj,
-            skip_compression,
-            skip_cors,
-            is_head_request,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => Python::attach(|py| {
-                error::build_error_response(
-                    py,
-                    500,
-                    format!("Handler returned unsupported response wire format: {}", e),
-                    vec![],
-                    None,
-                    state.debug,
+    match dispatch_result {
+        Ok(DispatchOutcome::Ready(response)) => response,
+        // Sync dispatch completed but body needs async post-processing (stream/file).
+        // Already parsed — no duplicate GIL acquire or wire re-parse.
+        Ok(DispatchOutcome::SyncResult(parsed)) => {
+            build_response_from_parsed(parsed, skip_compression, skip_cors, is_head_request).await
+        }
+        Ok(DispatchOutcome::Pending(fut)) => match fut.await {
+            Ok(result_obj) => {
+                match response_from_wire_result(
+                    result_obj,
+                    skip_compression,
+                    skip_cors,
+                    is_head_request,
                 )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(e) => Python::attach(|py| {
+                        error::build_error_response(
+                            py,
+                            500,
+                            format!(
+                                "Handler returned unsupported response wire format: {}",
+                                e
+                            ),
+                            vec![],
+                            None,
+                            state.debug,
+                        )
+                    }),
+                }
+            }
+            Err(e) => Python::attach(|py| {
+                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
             }),
         },
-        Err(e) => {
-            return Python::attach(|py| {
-                handle_python_error(py, e, &path_owned, &method_owned, state.debug)
-            });
-        }
+        Err(e) => Python::attach(|py| {
+            handle_python_error(py, e, &path_owned, &method_owned, state.debug)
+        }),
     }
 }

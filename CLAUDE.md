@@ -122,16 +122,28 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
    - `lib.rs` - PyO3 module entry point, registers Python-callable functions
    - `server.rs` - Actix Web server with tokio runtime, handles multi-worker/multi-process setup (includes CORS and compression via Actix middleware)
    - `router.rs` - matchit-based routing (zero-copy path matching)
-   - `handler.rs` - Python callback dispatcher via PyO3
+   - `handler.rs` - Python callback dispatcher via PyO3 with dual dispatch (sync/async paths via `DispatchOutcome` enum)
+   - `response_meta.rs` - Response metadata types (`ResponseMeta`, `ResponseType`, `CookieData`) with static constants for zero-alloc fast path
+   - `response_builder.rs` - Unified HTTP response building from `ResponseMeta` (content-type, headers, cookies all set in Rust)
+   - `request.rs` - `PyRequest` struct with `OnceLock` lazy allocation for form/files/state/meta dicts
+   - `request_pipeline.rs` - Typed parameter validation and caching
+   - `validation.rs` - Auth and guard validation pipeline
+   - `type_coercion.rs` - Rust-side parameter type coercion (UUID, Decimal, datetime, etc.)
    - `middleware/` - Custom middleware pipeline running in Rust (no Python GIL overhead)
      - `auth.rs` - JWT/API Key/Session authentication in Rust
      - `rate_limit.rs` - Token bucket rate limiting
    - `permissions.rs` - Guard/permission evaluation in Rust
    - `streaming.rs` - Streaming response handling (SSE, async generators)
    - `state.rs` - Shared server state (auth config, middleware config)
-   - `metadata.rs` - Route metadata structures
+   - `metadata.rs` - Route metadata structures including `RustArgBinding` for Rust-side parameter extraction
    - `error.rs` - Error handling and HTTP exceptions
-   - `request.rs` - Request handling utilities
+   - `form_parsing.rs` - Multipart and URL-encoded form parsing in Rust
+   - `json.rs` - JSON body parsing
+   - `cookies.rs` - Cookie parsing utilities
+   - `cors.rs` - CORS handling
+   - `static_files.rs` - Static file serving
+   - `asgi_http.rs` - ASGI HTTP mounting support
+   - `asgi_mounts.rs` - ASGI mount configuration
 
 2. **Python Framework (`python/django_bolt/`)**
 
@@ -141,7 +153,8 @@ just release VERSION=0.2.2 DRY_RUN=1    # Test without changes
    - `exceptions.py` - HTTPException and error handling
    - `params.py` - Parameter markers (Header, Cookie, Form, File, Depends)
    - `dependencies.py` - Dependency injection system
-   - `serialization.py` - msgspec-based serialization
+   - `serialization.py` - msgspec-based serialization with ResponseWireV1 format and integer meta tags
+   - `middleware_response.py` - `MiddlewareResponse` wrapper bridging internal wire format to middleware-compatible interface
    - `bootstrap.py` - Django configuration helper
    - `cli.py` - CLI tool for project initialization
    - `health.py` - Health check endpoints
@@ -186,7 +199,21 @@ HTTP Request → Actix Web (Rust)
       - IsAuthenticated, IsAdminUser, IsStaff
       - HasPermission, HasAnyPermission, HasAllPermissions
            ↓
-    Python Handler (PyO3 bridge - acquires GIL)
+    Dispatch (DispatchOutcome decision in handler.rs)
+      ┌─────────────────────────────────────────────────────┐
+      │ can_sync_dispatch=true?                              │
+      │ (no middleware, no signals, has sync executor)       │
+      ├──── YES ──────────────────────┬──── NO ─────────────┤
+      │ SYNC PATH                     │ ASYNC PATH          │
+      │ dispatch_sync.call1()         │ into_future_with    │
+      │ Parse ResponseWireV1          │ _locals() coroutine │
+      │ ┌─ body_kind?                 │ + asyncio event     │
+      │ │ bytes → Ready(HttpResponse) │ loop polling        │
+      │ │ stream/file → SyncResult    │                     │
+      │ │   (carry parsed wire to     │                     │
+      │ │    async post-processing)   │                     │
+      │ └─ All in one GIL block       │                     │
+      └───────────────────────────────┴─────────────────────┘
            ↓
     Parameter Extraction & Validation
       - Path params: {user_id} → function arg
@@ -198,12 +225,19 @@ HTTP Request → Actix Web (Rust)
       - Body: msgspec.Struct → validation
       - Dependencies: Depends(get_current_user)
            ↓
-    Handler Execution (async Python coroutine)
+    Handler Execution
+      - Sync handlers: direct call
+      - Trivially-async handlers: coro.send(None) → StopIteration
+      - True async handlers: await coroutine via asyncio
       - Django ORM access (async methods)
-      - Business logic
            ↓
-    Response Serialization
-      - msgspec for JSON (5-10x faster than stdlib)
+    Response Serialization (ResponseWireV1 format)
+      - Python returns 4-tuple: (status, meta, body_kind, body_payload)
+      - Integer meta tags (0-3) → static Rust ResponseMeta (zero alloc)
+      - Tuple meta for custom headers/cookies → Rust parses once
+      - Body kinds: 0=bytes (zero-copy via PyBackedBytes), 1=stream, 2=file
+      - Module-level msgspec.json.Encoder singleton
+      - Inline dict/list fast path (bypasses serialize_response)
       - Response model validation if specified
            ↓
     Response Compression (if enabled)
@@ -218,6 +252,12 @@ HTTP Request → Actix Web (Rust)
 - **Authentication/Guards run in Rust**: JWT validation, API key checks, and permission guards execute without Python GIL overhead
 - **Zero-copy routing**: matchit router matches paths without allocations
 - **Batched middleware**: Middleware (CORS, rate limiting, compression) runs in a pipeline before Python handler is invoked
+- **Sync dispatch bypass**: Eligible handlers skip the async bridge entirely (~6-12μs savings per request)
+- **Trivially-async optimization**: `async def` with no `await` detected via bytecode analysis, dispatched synchronously
+- **Zero-copy response body**: `PyBackedBytes` → `Bytes::from_owner()` eliminates memcpy for serialized response bodies
+- **Integer meta tags**: Common response types (JSON, plaintext, etc.) use integer tags mapped to static Rust constants — zero allocation per response
+- **Cookie serialization in Rust**: Raw cookie tuples pass from Python → Rust, eliminating Python `SimpleCookie` overhead
+- **Lazy request allocations**: Form/files/state/meta dicts use `OnceLock`, only allocated when accessed (~95% of requests save 2-4 dict allocations)
 - **Multi-process scaling**: SO_REUSEPORT allows kernel-level load balancing across processes
 - **msgspec serialization**: 5-10x faster than standard JSON for request/response handling
 - **Efficient compression**: Client-negotiated gzip/brotli/zstd compression in Rust
@@ -362,7 +402,8 @@ uv run --with pytest pytest python/tests -s -vv
 
 ### Serialization & Validation
 
-- `serialization.py` - msgspec-based serialization and validation
+- `serialization.py` - msgspec-based serialization, ResponseWireV1 format, integer meta tag constants (`_RESPONSE_META_JSON`, etc.), body kind constants (`_BODY_BYTES`, `_BODY_STREAM`, `_BODY_FILE`)
+- `middleware_response.py` - `MiddlewareResponse` wrapper bridging wire tuples to middleware-compatible objects
 - `param_functions.py` - Dynamic parameter handling
 
 ### Authentication & Security
@@ -431,7 +472,7 @@ uv run --with pytest pytest python/tests -s -vv
 
 1. Run benchmarks to quantify: `just save-bench` (creates baseline comparison)
 2. Check which component regressed: compare BENCHMARK_BASELINE.md vs BENCHMARK_DEV.md
-3. Profile Rust hot paths: check `src/handler.rs`, `src/routing.rs`, serialization
+3. Profile Rust hot paths: check `src/handler.rs`, `src/response_builder.rs`, `src/response_meta.rs`, `src/router.rs`
 4. Check for GIL contention in Python: look at `src/handler.rs` for Python interop efficiency
 5. Review recent commits for inefficient patterns (N+1 queries, unnecessary allocations, etc.)
 6. Use benchmarking to isolate: test individual endpoints
@@ -452,7 +493,14 @@ uv run --with pytest pytest python/tests -s -vv
 
 ### Core Framework Design
 
-- **Async and sync handler support**: The framework must handle both `async def` and `def` handlers, dispatching them correctly to Actix Web's runtime. Check `src/handler.rs` for implementation.
+- **Dual dispatch architecture**: Handlers are dispatched via three outcomes in `src/handler.rs`, controlled by `DispatchOutcome` enum:
+  - **Sync path** (`DispatchOutcome::Ready`): Calls `dispatch_sync.call1()`, parses `ResponseWireV1`, builds `HttpResponse` — all in one `Python::attach` GIL block. Used when `can_sync_dispatch` flag is set in `RouteExecutionPlan` and body is bytes.
+  - **Sync + async post-processing** (`DispatchOutcome::SyncResult`): Handler runs synchronously but returns a stream/file body that needs async handling. Carries the already-parsed `ParsedResponseWire` to avoid re-acquiring GIL.
+  - **Async path** (`DispatchOutcome::Pending`): Creates coroutine via `dispatch.call1()`, converts to Rust future via `into_future_with_locals()`. Used for handlers with middleware, signals, or true async awaits.
+- **Trivially-async handlers**: `async def` functions that never `await` are detected at registration via `dis.get_instructions()` (checking for `GET_AWAITABLE` opcode). These get a sync executor that drives the coroutine via `coro.send(None)` → `StopIteration`, avoiding the async bridge entirely.
+- **ResponseWireV1 format**: Python returns `(status, meta, body_kind, body_payload)` — meta is either an integer tag (fast path) or a 4-tuple `(response_type, custom_ct, headers, cookies)` (slow path). Body kind: 0=bytes, 1=stream, 2=file.
+- **Zero-copy response body**: `PyBackedBytes` holds a reference to Python bytes. `Bytes::from_owner()` wraps it without memcpy, used for JSON/serialized bodies.
+- **MiddlewareResponse bridge**: `python/django_bolt/middleware_response.py` wraps internal wire tuples into middleware-compatible objects with `.status_code` and `.headers` attributes. Raw cookie tuples are preserved (not serialized in Python) — Rust handles all cookie serialization.
 - **Python-Rust bridge (PyO3)**: Handler execution crosses the GIL boundary. Minimize Python work in Rust hot paths. See `src/handler.rs` for GIL management patterns.
 - **Middleware compilation**: Middleware decorators on handlers are converted to Rust metadata structs at server startup. Implementation in `python/django_bolt/middleware/compiler.py` and `src/metadata.rs`.
 - **Route autodiscovery**: Runs once at startup. No hot-reload in production (only in `--dev` mode). See `python/django_bolt/management/commands/runbolt.py`.
@@ -471,7 +519,7 @@ uv run --with pytest pytest python/tests -s -vv
 ### Adding Framework Features
 
 - **New parameter types** (Query, Header, Body variants): Edit `python/django_bolt/params.py` and `python/django_bolt/binding.py`, then update `src/handler.rs` for extraction
-- **New response types**: Add to `python/django_bolt/responses.py` and implement serialization in `src/handler.rs`
+- **New response types**: Add to `python/django_bolt/responses.py`, implement serialization in `python/django_bolt/serialization.py`, and if adding a new common type, add integer meta tag constant there + matching static `ResponseMeta` in `src/response_meta.rs`
 - **New authentication backend**: Extend `python/django_bolt/auth/backends.py` with new class, optionally implement validation in `src/middleware/auth.rs` for performance
 - **New guard/permission type**: Add to `python/django_bolt/auth/guards.py` and implement check in `src/permissions.rs`
 - **New middleware system**: Add to `python/django_bolt/middleware/`, implement compiler in `middleware/compiler.py`, and Rust handler in `src/middleware/`
@@ -479,8 +527,11 @@ uv run --with pytest pytest python/tests -s -vv
 ### Performance Improvements
 
 - **Serialization speed**: `python/django_bolt/serialization.py` and `src/handler.rs`
+- **Response building**: `src/response_builder.rs` (header/cookie/content-type setting) and `src/response_meta.rs` (static meta constants)
 - **Routing performance**: `src/router.rs`
 - **GIL contention**: Reduce Python work in hot paths, consider moving logic to Rust in `src/handler.rs`
+- **Request allocation**: `src/request.rs` (lazy dict allocation via `OnceLock`)
+- **Middleware response overhead**: `python/django_bolt/middleware_response.py` (wire format bridge)
 - **Compression**: `python/django_bolt/middleware/compression.py` and `src/middleware/compression.rs`
 
 ## Performance Principles (Hot Path)
@@ -493,7 +544,7 @@ All route metadata keys must be guaranteed at registration time so the dispatch 
 
 ### Hot Path Rules
 
-When modifying code in the per-request dispatch path (`api.py:_dispatch`, `serialization.py:serialize_response`, `_kwargs/model.py` injectors, `dependencies.py`):
+When modifying code in the per-request dispatch path (`api.py:_dispatch`, `api.py:_dispatch_sync`, `serialization.py:serialize_response`, `_kwargs/model.py` injectors, `dependencies.py`):
 
 1. **No string dispatch in loops** -- Pre-sort fields into source buckets (path, query, header, cookie, form) at registration time. Iterate pre-built lists at request time instead of `if source == "path"` chains.
 2. **Pre-compute singleton tuples/headers** -- Response metadata tuples (`_RESPONSE_META_JSON`, error headers) should be module-level constants, not rebuilt per response.
@@ -506,6 +557,36 @@ When modifying code in the per-request dispatch path (`api.py:_dispatch`, `seria
 9. **Parallel dependency resolution** -- Pre-compute dependency graph at registration. Execute independent deps concurrently with `asyncio.gather()`.
 10. **Pre-bind serializers** -- Use `functools.partial` to bind handler-specific serializer config at registration, avoiding per-call config lookups.
 
+### PyO3 Async Bridge Optimization
+
+The `pyo3_async_runtimes::into_future_with_locals()` call adds ~6-12μs per request (coroutine creation + asyncio event loop polling). This is the single biggest per-request overhead for simple handlers. Strategies to eliminate it:
+
+1. **Sync dispatch bypass** -- For handlers with no middleware/signals, Rust calls `dispatch_sync.call1()` directly within a single `Python::attach` GIL block. Returns `DispatchOutcome::Ready(HttpResponse)` instead of `DispatchOutcome::Pending(Future)`. Controlled by `can_sync_dispatch` flag in `RouteExecutionPlan` bitfield, computed at registration.
+
+2. **Trivially-async detection** -- Use `dis.get_instructions()` at registration time to check for `GET_AWAITABLE` opcode. If absent, the `async def` never actually awaits and can be driven synchronously via `coro.send(None)` → `StopIteration`. Set `meta["_sync_executor"]` for these handlers so they go through the sync dispatch path in Rust.
+
+3. **When to use sync dispatch** -- Only when ALL conditions are met: handler has `_sync_executor`, no Python middleware (global or route), no Django middleware, no signals. If any condition fails, fall back to full async path.
+
+### Response Wire Format Optimization
+
+The Python→Rust response wire format `(status, meta, body_kind, body)` (ResponseWireV1) has two meta encoding paths and three body encoding paths:
+
+**Meta encoding:**
+
+1. **Integer meta tags (fast path)** -- Common response types use integer tags (0=JSON, 1=plaintext, 2=octetstream, 3=empty) defined in `serialization.py`. Rust maps these to static `ResponseMeta` constants in `response_meta.rs` via `MetaRef::Static(&'static ResponseMeta)` — zero allocation, zero tuple parsing.
+
+2. **Tuple meta (slow path)** -- Responses with custom headers/cookies use full `(response_type, custom_ct, headers, cookies)` tuples parsed into `MetaRef::Owned(ResponseMeta)`. Cookie tuples are 9-element tuples `(name, value, path, max_age, expires, domain, secure, httponly, samesite)` — Rust serializes them to `Set-Cookie` headers directly.
+
+**Body encoding (body_kind integer):**
+
+- `0` (_BODY_BYTES) -- bytes payload. Rust uses `PyBackedBytes` → `Bytes::from_owner()` for zero-copy when possible, falls back to `Vec<u8>` extraction.
+- `1` (_BODY_STREAM) -- StreamingResponse object. Rust creates SSE or chunked stream from Python async generator.
+- `2` (_BODY_FILE) -- File path string. Rust opens and streams the file asynchronously via tokio.
+
+**Middleware compatibility:** `MiddlewareResponse` class in `middleware_response.py` converts between wire tuples and middleware-friendly objects. It preserves raw cookie tuples (never serializes in Python) so Rust handles all cookie serialization.
+
+When adding new common response types, add both a Python integer constant and a Rust static constant, and keep them in sync.
+
 ### What NOT to Do on the Hot Path
 
 - `hasattr()` checks (use `__init__` to set attributes)
@@ -514,6 +595,8 @@ When modifying code in the per-request dispatch path (`api.py:_dispatch`, `seria
 - Double dict lookups (`if d.get(k): v = d[k]` -- use walrus or single `.get()`)
 - String parsing in error formatting when structured data is available
 - Duplicate async/sync code paths -- extract shared logic into helpers
+- Thread-local encoders when module-level singletons work (GIL guarantees thread safety)
+- Per-response tuple construction for common response types (use integer meta tags)
 
 ### Testing
 
