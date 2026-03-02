@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dis
 import inspect
 import sys
 import threading
@@ -41,7 +42,7 @@ from .error_handlers import handle_exception
 from .exceptions import HTTPException
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig
-from .middleware.compiler import add_optimization_flags_to_metadata, compile_middleware_meta
+from .middleware.compiler import _compile_rust_arg_bindings, add_optimization_flags_to_metadata, compile_middleware_meta
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
@@ -59,9 +60,12 @@ from .pagination import extract_pagination_item_type
 from .responses import JSON as _JSONResponse
 from .router import Router
 from .serialization import (
+    _BODY_BYTES,
     _RESPONSE_META_EMPTY,
+    _RESPONSE_META_JSON,
     ResponseWireV1,
     _convert_serializers,
+    _extract_stream_item_type,
     _wire_bytes,
     serialize_json_data,
     serialize_json_data_sync,
@@ -287,7 +291,7 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
         custom_headers or None,
         None,
     )
-    return int(status), meta, "bytes", body
+    return int(status), meta, _BODY_BYTES, body
 
 
 class BoltAPI:
@@ -1171,6 +1175,8 @@ class BoltAPI:
                 meta.update(response_meta)
             else:
                 meta["response_type"] = None
+            # Pre-compute stream annotation analysis (registration time only)
+            meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 
             # If handler is paginated, extract and store the item serializer
             # This enables @paginate to use Serializer.dump_many() for efficient serialization
@@ -1209,6 +1215,7 @@ class BoltAPI:
                     entry: dict = {
                         "response_type": resp_type,
                         "default_status_code": code if isinstance(code, int) else handler_default_status,
+                        "_stream_info": _extract_stream_item_type(resp_type),
                     }
                     if code in field_names_map:
                         entry["response_field_names"] = field_names_map[code]
@@ -1221,6 +1228,7 @@ class BoltAPI:
             meta["injector"] = injector
             # Store whether injector is async (avoids runtime check with inspect.iscoroutinefunction)
             meta["injector_is_async"] = inspect.iscoroutinefunction(injector)
+            meta["_original_fn"] = fn
             meta["_handler_executor"] = self._compile_handler_executor(meta)
 
             # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
@@ -1258,11 +1266,21 @@ class BoltAPI:
             # These are parsed by Rust's RouteMetadata::from_python() to skip unused parsing
             middleware_meta = add_optimization_flags_to_metadata(middleware_meta, meta)
 
+            # Sync dispatch bypass: Rust calls Python synchronously (no coroutine/async bridge).
+            # Eligible when handler has a plain sync executor and no middleware/signals overhead.
+            can_sync_dispatch = (
+                "_sync_executor" in meta
+                and not meta["_has_route_python_middleware"]
+                and not self._has_python_global_middleware
+                and not self._has_django_middleware
+                and not self._emit_signals
+            )
+            middleware_meta["can_sync_dispatch"] = can_sync_dispatch
+
             # Python middleware requires cookies and headers regardless of handler params
             # Django middleware needs cookies/headers (CSRF, session, auth, etc.)
             # Custom middleware may also inspect headers for routing, auth, etc.
-            has_python_global_middleware = any(not isinstance(spec, dict) for spec in self._middleware)
-            if self._has_django_middleware or has_python_global_middleware or meta["_has_route_python_middleware"]:
+            if self._has_django_middleware or self._has_python_global_middleware or meta["_has_route_python_middleware"]:
                 middleware_meta["needs_cookies"] = True
                 middleware_meta["needs_headers"] = True
 
@@ -1303,6 +1321,10 @@ class BoltAPI:
         is_blocking = meta.get("is_blocking", False)
         injector = meta["injector"]
         injector_is_async = meta["injector_is_async"]
+
+        # Pre-compute at registration time: can Rust ever pre-bind args into request.state?
+        # When False, we skip the state.setdefault + 2 pop calls on every request.
+        has_rust_prebound = bool(_compile_rust_arg_bindings(meta))
 
         # Multi-response: specialize the executor at registration time so that the
         # is_multi branching never touches the hot path of normal (single-schema) routes.
@@ -1395,6 +1417,112 @@ class BoltAPI:
 
             return execute_multi
 
+        # Fast path: async handler without rust-prebound args (most common pattern).
+        # Eliminates: state.setdefault, 2×state.pop, has_prebound check.
+        if mode != "request_only" and is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
+            response_type = meta["response_type"]
+            default_status = meta["default_status_code"]
+
+            # Detect trivially-async handlers: async def with no await statements.
+            # These can be dispatched synchronously by driving the coroutine inline
+            # via coro.send(None) → StopIteration, avoiding the entire async bridge.
+            # Detection: check bytecode for GET_AWAITABLE opcode (emitted for every await).
+            _original_fn = meta.get("_original_fn") or meta.get("handler")
+            _trivially_async = False
+            if _original_fn is not None:
+                try:
+                    _code = _original_fn.__code__
+                    _trivially_async = not any(
+                        i.opname == "GET_AWAITABLE" for i in dis.get_instructions(_code)
+                    )
+                except (AttributeError, TypeError):
+                    pass
+
+            # Super-fast path: no response_type validation → inline dict/list serialization
+            # directly into the executor. Eliminates 2 async function call overheads
+            # (serialize_response + serialize_json_data are both async but never suspend
+            # for dict returns with no response model).
+            if response_type is None:
+                _encode = _json.encode
+                _meta_json = _RESPONSE_META_JSON
+
+                if _trivially_async:
+                    # Sync executor for trivially-async handlers: drive coroutine inline.
+                    # coro.send(None) immediately raises StopIteration since there are
+                    # no await points. This bypasses the entire async bridge (~6-12μs).
+                    def execute_trivial_async_sync(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                        args, kwargs = injector(request)
+                        coro = handler(*args, **kwargs)
+                        try:
+                            coro.send(None)
+                        except StopIteration as _e:
+                            result = _e.value
+                        else:
+                            coro.close()
+                            raise RuntimeError("Handler awaited unexpectedly in sync dispatch")
+                        if isinstance(result, dict):
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                        if isinstance(result, list):
+                            result = _convert_serializers(result)
+                            return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                        return serialize_response_sync(result, meta)
+
+                    meta["_sync_executor"] = execute_trivial_async_sync
+
+                async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                    args, kwargs = injector(request)
+                    result = await handler(*args, **kwargs)
+                    if isinstance(result, dict):
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    if isinstance(result, list):
+                        result = _convert_serializers(result)
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    return await serialize_response(result, meta)
+
+                return execute_async_dict_fast
+
+            async def execute_async_no_prebound(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                args, kwargs = injector(request)
+                result = await handler(*args, **kwargs)
+                return await serialize_response(result, meta)
+
+            return execute_async_no_prebound
+
+        # Fast path for sync non-blocking handler without rust-prebound args.
+        if mode != "request_only" and not is_async and not is_blocking and not has_rust_prebound and not injector_is_async:
+            response_type = meta["response_type"]
+            default_status = meta["default_status_code"]
+
+            if response_type is None:
+                _encode = _json.encode
+                _meta_json = _RESPONSE_META_JSON
+
+                # Plain (non-async) sync executor for Rust sync dispatch bypass.
+                # Eliminates coroutine creation + into_future_with_locals overhead.
+                def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                    args, kwargs = injector(request)
+                    result = handler(*args, **kwargs)
+                    if isinstance(result, dict):
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    if isinstance(result, list):
+                        result = _convert_serializers(result)
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    return serialize_response_sync(result, meta)
+
+                meta["_sync_executor"] = execute_sync_dict_fast_plain
+
+                async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
+                    args, kwargs = injector(request)
+                    result = handler(*args, **kwargs)
+                    if isinstance(result, dict):
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    if isinstance(result, list):
+                        result = _convert_serializers(result)
+                        return (default_status, _meta_json, _BODY_BYTES, _encode(result))
+                    return serialize_response_sync(result, meta)
+
+                return execute_sync_dict_fast
+
         async def execute(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
             request_state = request.setdefault("state", {})
 
@@ -1406,9 +1534,12 @@ class BoltAPI:
                 else:
                     result = handler(request)
             else:
-                prebound_args = request_state.pop("_bolt_prebound_args", None)
-                prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
-                has_prebound = prebound_args is not None and prebound_kwargs is not None
+                if has_rust_prebound:
+                    prebound_args = request_state.pop("_bolt_prebound_args", None)
+                    prebound_kwargs = request_state.pop("_bolt_prebound_kwargs", None)
+                    has_prebound = prebound_args is not None and prebound_kwargs is not None
+                else:
+                    has_prebound = False
 
                 if has_prebound:
                     args, kwargs = prebound_args, prebound_kwargs
@@ -1674,19 +1805,16 @@ class BoltAPI:
 
             # 2. Lazy user loading using SimpleLazyObject (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
+            # Skip setting user=None — PyRequest.user getter already returns None.
             auth_context = request.get("auth")
-            user_id = auth_context.get("user_id") if auth_context else None
-            if user_id:
-                backend_name = auth_context.get("auth_backend")
-                # Use pre-computed is_async from handler metadata (avoids runtime loop check)
-                # Default True for handlers without explicit async metadata
-                is_async_ctx = meta.get("is_async", True)
-                # Use functools.partial instead of lambda - faster, no closure overhead
-                request["user"] = SimpleLazyObject(
-                    partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
-                )
-            else:
-                request["user"] = None
+            if auth_context:
+                user_id = auth_context.get("user_id")
+                if user_id:
+                    backend_name = auth_context.get("auth_backend")
+                    is_async_ctx = meta["is_async"]
+                    request["user"] = SimpleLazyObject(
+                        partial(load_user_sync, user_id, backend_name, auth_context, is_async_ctx)
+                    )
 
             # 3. Check if we need to execute middleware
             # Middleware runs for:
@@ -1694,7 +1822,7 @@ class BoltAPI:
             # - Router/route Python middleware on this handler
             middleware_owner = original_api if original_api is not None else self
             has_python_global_middleware = middleware_owner._has_python_global_middleware
-            has_route_python_middleware = bool(meta.get("_has_route_python_middleware", False))
+            has_route_python_middleware = meta["_has_route_python_middleware"]
             api_with_middleware = (
                 middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
             )
@@ -1731,7 +1859,72 @@ class BoltAPI:
         finally:
             # Auto-cleanup UploadFiles to prevent resource leaks
             # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
-            if meta.get("has_file_uploads"):
+            if meta["has_file_uploads"]:
+                request_state = request.setdefault("state", {})
+                upload_files = request_state.get("_upload_files", [])
+                for upload in upload_files:
+                    with suppress(Exception):
+                        upload.close_sync()
+
+    def _dispatch_sync(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:
+        """
+        Synchronous dispatch for sync handlers without middleware/signals.
+
+        Called directly from Rust via dispatch_sync.call1() - no coroutine creation,
+        no into_future_with_locals, no asyncio event loop polling. This eliminates
+        ~6-12us of async bridge overhead per request.
+
+        Prerequisites (checked at registration time, stored in can_sync_dispatch flag):
+        - Handler has a _sync_executor (sync, non-blocking, simple params)
+        - No Python middleware (global or route-level)
+        - No Django middleware
+        - No signals
+        """
+        original_api = self._handler_api_map.get(handler_id) if handler_id is not None else None
+        logging_middleware = original_api._logging_middleware if original_api else self._logging_middleware
+
+        start_time = None
+        if logging_middleware:
+            if logging_middleware._should_time_cached:
+                start_time = time.time()
+            if logging_middleware._request_debug_enabled_cached:
+                logging_middleware.log_request(request)
+
+        try:
+            meta = self._handler_meta[handler_id]
+
+            # Lazy user loading: only set when auth context has a user_id.
+            # Skip setting user=None — PyRequest.user getter already returns None.
+            auth_context = request.get("auth")
+            if auth_context:
+                user_id = auth_context.get("user_id")
+                if user_id:
+                    backend_name = auth_context.get("auth_backend")
+                    request["user"] = SimpleLazyObject(
+                        partial(load_user_sync, user_id, backend_name, auth_context, False)
+                    )
+
+            # Call pre-compiled sync executor directly (no coroutine, no await)
+            response = meta["_sync_executor"](handler, request)
+
+            if logging_middleware and start_time is not None:
+                duration = time.time() - start_time
+                status_code = response[0] if isinstance(response, tuple) else 200
+                logging_middleware.log_response(request, status_code, duration)
+
+            return response
+
+        except HTTPException as he:
+            if logging_middleware and start_time is not None:
+                duration = time.time() - start_time
+                logging_middleware.log_response(request, he.status_code, duration)
+            return self._handle_http_exception(he)
+        except Exception as e:
+            if logging_middleware:
+                logging_middleware.log_exception(request, e, exc_info=True)
+            return self._handle_generic_exception(e, request=request)
+        finally:
+            if meta["has_file_uploads"]:
                 request_state = request.setdefault("state", {})
                 upload_files = request_state.get("_upload_files", [])
                 for upload in upload_files:
