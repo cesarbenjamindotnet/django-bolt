@@ -192,7 +192,7 @@ Get a single object by primary key:
 ```python
 async def retrieve(self, request, pk: int):
     article = await self.get_object(pk)  # Raises 404 if not found
-    return ArticleSchema.from_model(article)
+    return await ArticleSchema.afrom_model(article)
 ```
 
 ### Custom lookup field

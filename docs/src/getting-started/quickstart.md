@@ -105,6 +105,8 @@ Visit `http://localhost:8000/` in your browser:
 {"status": "operational", "message": "Mission Control Online"}
 ```
 
+If you're exploring the bundled multi-app example project in this repo instead of starting from a fresh tutorial app, the equivalent route lives at `/mission-control` because `/` is already used by the top-level example API.
+
 ## Path parameters
 
 Let's add an endpoint to get a specific mission by ID. Path parameters are defined using curly braces:
@@ -196,7 +198,7 @@ from typing import Annotated
 
 from msgspec import Meta
 
-from django_bolt.serializers import Serializer, field_validator
+from django_bolt.serializers import Serializer, field, field_validator
 
 
 class CreateMission(Serializer):
@@ -380,7 +382,7 @@ class CreateAstronaut(Serializer):
 
     @field_validator("role")
     def validate_role(cls, value):
-        valid_roles = ["Commander", "Pilot", "Mission Specialist", "Flight Engineer"]
+        valid_roles = ["Commander", "Pilot", "Mission Specialist", "Flight Engineer", "Payload Specialist"]
         if value not in valid_roles:
             raise ValueError(f"Role must be one of: {', '.join(valid_roles)}")
         return value
@@ -472,6 +474,98 @@ Test with a file:
 curl -X POST http://localhost:8000/missions/1/patch \
   -F "patch=@mission_patch.png"
 ```
+
+## Response serializers
+
+So far we've been building response dicts by hand. That's a great way to learn the basics and keeps the early examples easy to follow.
+
+Once the same response shapes start showing up in multiple endpoints, move them into `Serializer` classes too. That gives you reusable, typed response contracts and keeps the model-to-JSON mapping in one place.
+
+```python
+import asyncio
+
+from django_bolt.serializers import Serializer, field
+
+
+class MissionResponse(Serializer):
+    id: int
+    name: str
+    status: str
+    launch_date: datetime | None = None
+    description: str = ""
+
+
+class MissionListResponse(Serializer):
+    missions: list[MissionResponse]
+    count: int
+
+
+class AstronautResponse(Serializer):
+    id: int
+    name: str
+    role: str
+    mission_id: int
+
+
+class AstronautListResponse(Serializer):
+    mission: str
+    astronauts: list[AstronautResponse]
+
+
+class AstronautCreatedResponse(Serializer):
+    id: int
+    name: str
+    role: str
+    mission: str = field(source="mission.name")
+
+
+@api.get("/missions")
+async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionListResponse:
+    queryset = Mission.objects.all()
+    if filters.status:
+        queryset = queryset.filter(status=filters.status)
+
+    mission_tasks = [
+        MissionResponse.afrom_model(mission)
+        async for mission in queryset[:filters.limit]
+    ]
+    missions = list(await asyncio.gather(*mission_tasks))
+
+    return MissionListResponse(missions=missions, count=len(missions))
+
+
+@api.get("/missions/{mission_id}")
+async def get_mission(mission_id: int) -> MissionResponse:
+    try:
+        mission = await Mission.objects.aget(id=mission_id)
+        return await MissionResponse.afrom_model(mission)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
+
+
+@api.post("/missions/{mission_id}/astronauts")
+async def add_astronaut(
+    mission_id: int,
+    data: Annotated[CreateAstronaut, Form()],
+) -> AstronautCreatedResponse:
+    try:
+        mission = await Mission.objects.aget(id=mission_id)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
+
+    astronaut = await Astronaut.objects.acreate(
+        name=data.name,
+        role=data.role,
+        mission=mission,
+    )
+    return await AstronautCreatedResponse.afrom_model(astronaut)
+```
+
+A few things to notice:
+
+- In async handlers, `await afrom_model()` is the safest default for response serializers. It keeps working if you later add related fields.
+- `from_model()` is still great when you're mapping already-loaded model data in sync code, or when you know your async response stays flat and fully loaded.
+- Plain `list[AstronautResponse]` is enough for nested response fields. You don't need `Nested(..., many=True)` just to express a list of child serializers.
 
 ## Response types
 
@@ -642,6 +736,7 @@ Here's the complete `missions/api.py` file:
 ```python
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime
 from typing import Annotated, Literal
@@ -653,7 +748,7 @@ from django_bolt.exceptions import HTTPException, NotFound
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import File, Form, Header, Query
 from django_bolt.responses import HTML, PlainText, Redirect
-from django_bolt.serializers import Serializer, field_validator
+from django_bolt.serializers import Serializer, field, field_validator
 from django_bolt.shortcuts import render
 
 from missions.models import Astronaut, Mission
@@ -667,7 +762,7 @@ api = BoltAPI(
 )
 
 
-# Schemas
+# Input and output schemas
 class CreateMission(Serializer):
     name: Annotated[str, Meta(min_length=1, max_length=100)]
     description: Annotated[str, Meta(max_length=500)] = ""
@@ -686,6 +781,26 @@ class UpdateMission(Serializer):
     description: Annotated[str, Meta(max_length=500)] | None = None
 
 
+class MissionResponse(Serializer):
+    id: int
+    name: str
+    status: str
+    launch_date: datetime | None = None
+    description: str = ""
+
+
+class MissionListResponse(Serializer):
+    missions: list[MissionResponse]
+    count: int
+
+
+class MissionCreatedResponse(Serializer):
+    id: int
+    name: str
+    status: str
+    message: str
+
+
 # Query parameter model for filtering missions
 class MissionFilters(Serializer):
     status: Literal["planned", "active", "completed", "aborted"] | None = None
@@ -699,10 +814,29 @@ class CreateAstronaut(Serializer):
 
     @field_validator("role")
     def validate_role(cls, value):
-        valid_roles = ["Commander", "Pilot", "Mission Specialist", "Flight Engineer"]
+        valid_roles = ["Commander", "Pilot", "Mission Specialist", "Flight Engineer", "Payload Specialist"]
         if value not in valid_roles:
             raise ValueError(f"Role must be one of: {', '.join(valid_roles)}")
         return value
+
+
+class AstronautResponse(Serializer):
+    id: int
+    name: str
+    role: str
+    mission_id: int
+
+
+class AstronautCreatedResponse(Serializer):
+    id: int
+    name: str
+    role: str
+    mission: str = field(source="mission.name")
+
+
+class AstronautListResponse(Serializer):
+    mission: str
+    astronauts: list[AstronautResponse]
 
 
 # Endpoints
@@ -712,57 +846,50 @@ async def mission_control_status():
 
 
 @api.get("/missions", tags=["missions"])
-async def list_missions(filters: Annotated[MissionFilters, Query()]):
+async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionListResponse:
     queryset = Mission.objects.all()
     if filters.status:
         queryset = queryset.filter(status=filters.status)
 
-    missions = []
-    async for mission in queryset[:filters.limit]:
-        missions.append({
-            "id": mission.id,
-            "name": mission.name,
-            "status": mission.status,
-        })
-    return {"missions": missions, "count": len(missions)}
+    mission_tasks = [
+        MissionResponse.afrom_model(mission)
+        async for mission in queryset[:filters.limit]
+    ]
+    missions = list(await asyncio.gather(*mission_tasks))
+    return MissionListResponse(missions=missions, count=len(missions))
 
 
 @api.get("/missions/{mission_id}", tags=["missions"])
-async def get_mission(mission_id: int):
+async def get_mission(mission_id: int) -> MissionResponse:
     try:
         mission = await Mission.objects.aget(id=mission_id)
-        return {
-            "id": mission.id,
-            "name": mission.name,
-            "status": mission.status,
-            "launch_date": str(mission.launch_date) if mission.launch_date else None,
-            "description": mission.description,
-        }
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+        return await MissionResponse.afrom_model(mission)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
 
 @api.post("/missions", tags=["missions"])
-async def create_mission(mission: CreateMission):
+async def create_mission(mission: CreateMission) -> MissionCreatedResponse:
     new_mission = await Mission.objects.acreate(
         name=mission.name,
         description=mission.description,
         launch_date=mission.launch_date,
         status="planned",
     )
-    return {
-        "id": new_mission.id,
-        "name": new_mission.name,
-        "status": new_mission.status,
-    }
+    return MissionCreatedResponse(
+        id=new_mission.id,
+        name=new_mission.name,
+        status=new_mission.status,
+        message="Mission created successfully",
+    )
 
 
 @api.put("/missions/{mission_id}", tags=["missions"])
-async def update_mission(mission_id: int, data: UpdateMission):
+async def update_mission(mission_id: int, data: UpdateMission) -> MissionResponse:
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     if data.name is not None:
         mission.name = data.name
@@ -772,15 +899,15 @@ async def update_mission(mission_id: int, data: UpdateMission):
         mission.description = data.description
 
     await mission.asave()
-    return {"id": mission.id, "name": mission.name, "status": mission.status}
+    return await MissionResponse.afrom_model(mission)
 
 
 @api.delete("/missions/{mission_id}", status_code=204, tags=["missions"])
 async def delete_mission(mission_id: int):
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     await mission.adelete()
 
@@ -795,8 +922,8 @@ async def get_classified_info(
 
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     return {
         "mission": mission.name,
@@ -808,8 +935,8 @@ async def get_classified_info(
 async def get_mission_log(mission_id: int):
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     log = f"=== MISSION LOG: {mission.name} ===\nStatus: {mission.status.upper()}"
     return PlainText(log)
@@ -822,8 +949,8 @@ async def upload_mission_patch(
 ):
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     if not patch:
         raise HTTPException(status_code=400, detail="No file uploaded")
@@ -847,40 +974,33 @@ async def upload_mission_patch(
 async def add_astronaut(
     mission_id: int,
     data: Annotated[CreateAstronaut, Form()],
-):
+) -> AstronautCreatedResponse:
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     astronaut = await Astronaut.objects.acreate(
         name=data.name,
         role=data.role,
         mission=mission,
     )
-    return {
-        "id": astronaut.id,
-        "name": astronaut.name,
-        "role": astronaut.role,
-        "mission": mission.name,
-    }
+    return await AstronautCreatedResponse.afrom_model(astronaut)
 
 
 @api.get("/missions/{mission_id}/astronauts", tags=["astronauts"])
-async def list_astronauts(mission_id: int):
+async def list_astronauts(mission_id: int) -> AstronautListResponse:
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
-    astronauts = []
-    async for astronaut in Astronaut.objects.filter(mission=mission):
-        astronauts.append({
-            "id": astronaut.id,
-            "name": astronaut.name,
-            "role": astronaut.role,
-        })
-    return {"mission": mission.name, "astronauts": astronauts}
+    astronaut_tasks = [
+        AstronautResponse.afrom_model(astronaut)
+        async for astronaut in Astronaut.objects.filter(mission=mission)
+    ]
+    astronauts = list(await asyncio.gather(*astronaut_tasks))
+    return AstronautListResponse(mission=mission.name, astronauts=astronauts)
 
 
 @api.get("/status-page", tags=["status"])

@@ -32,7 +32,6 @@ from django_bolt.serializers import (
     URL,
     Email,
     Meta,
-    Nested,
     NonEmptyStr,
     PositiveInt,
     Serializer,
@@ -84,7 +83,7 @@ class CommentSerializer(Serializer):
 
     id: int
     text: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
     created_at: datetime
 
 
@@ -94,9 +93,9 @@ class BlogPostSerializer(Serializer):
     id: int
     title: NonEmptyStr
     content: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
-    comments: Annotated[list[CommentSerializer], Nested(CommentSerializer, many=True)] = []
+    author: AuthorSerializer
+    tags: list[TagSerializer]
+    comments: list[CommentSerializer] = []
     published: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -155,7 +154,7 @@ class UserProfileSerializer(Serializer):
     """User profile serializer with nested user."""
 
     id: int
-    user: Annotated[UserSerializer, Nested(UserSerializer)]
+    user: UserSerializer
     bio: str = ""
     avatar_url: URL | None = None
     phone: str = ""
@@ -1093,6 +1092,35 @@ class TestCreateSerializerHelpersWithDjango:
         assert "is_active" in UserSerializer.__annotations__
 
     @pytest.mark.django_db
+    def test_create_serializer_config_applies_end_to_end(self):
+        """Test create_serializer uses Config metadata for model mapping and dump behavior."""
+        UserGeneratedSerializer = create_serializer(
+            User,
+            fields=["id", "username", "email", "password_hash", "created_at"],
+            write_only={"password_hash"},
+            read_only={"id", "created_at"},
+            serializer_name="UserGeneratedSerializer",
+        )
+
+        user = User.objects.create(
+            username="helperuser",
+            email="helper@example.com",
+            password_hash="super-secret",
+        )
+
+        serializer = UserGeneratedSerializer.from_model(user)
+        dumped = serializer.dump()
+
+        assert UserGeneratedSerializer.Config.model is User
+        assert UserGeneratedSerializer.__write_only_fields__ == frozenset({"password_hash"})
+        assert UserGeneratedSerializer.__read_only_fields__ == frozenset({"id", "created_at"})
+        assert dumped["id"] == user.id
+        assert dumped["username"] == "helperuser"
+        assert dumped["email"] == "helper@example.com"
+        assert "created_at" in dumped
+        assert "password_hash" not in dumped
+
+    @pytest.mark.django_db
     def test_create_serializer_set_with_django(self):
         """Test create_serializer_set with Django model."""
         from django.contrib.auth.models import User as DjangoUser  # noqa: PLC0415
@@ -1320,7 +1348,7 @@ class ComprehensiveProductSerializer(Serializer):
     5. @field_validator decorator for field-level validation/transformation
     6. @model_validator decorator for cross-field validation
     7. @computed_field decorator for calculated output fields
-    8. Nested serializers with Nested() annotation (single and many=True)
+    8. Nested serializers inferred from serializer type hints
     9. Meta class configuration (write_only, read_only, field_sets)
     10. Dynamic field selection (only, exclude, use)
     11. Type-safe subsets (subset, fields)
@@ -1398,12 +1426,12 @@ class ComprehensiveProductSerializer(Serializer):
     # -------------------------------------------------------------------------
     # 12. Nested serializer (single object - ForeignKey equivalent)
     # -------------------------------------------------------------------------
-    supplier: Annotated[AuthorSerializer | None, Nested(AuthorSerializer)] = None
+    supplier: AuthorSerializer | None = None
 
     # -------------------------------------------------------------------------
-    # 13. Nested serializer with many=True (ManyToMany equivalent)
+    # 13. Nested serializer list (ManyToMany equivalent)
     # -------------------------------------------------------------------------
-    related_tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)] = field(default_factory=list)
+    related_tags: list[TagSerializer] = field(default_factory=list)
 
     # -------------------------------------------------------------------------
     # Config class configuration

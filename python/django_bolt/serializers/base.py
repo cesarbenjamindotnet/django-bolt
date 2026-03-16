@@ -1,20 +1,42 @@
 """Base Serializer class extending msgspec.Struct with validation and Django integration."""
 
+# The feature-heavy dump path still runs in Python. If we push serializer
+# execution further into Rust later, this module is the main place where a
+# dump-plan executor could replace slow-path field iteration.
+
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, get_args, get_origin, get_type_hints
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from types import UnionType
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    TypeVar,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+from weakref import WeakKeyDictionary
 
 import msgspec
+from django.core.exceptions import FieldDoesNotExist
 from django.db.models import Model as DjangoModel
+from django.db.models.manager import BaseManager
+from django.db.models.query import QuerySet
 from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
-from msgspec._core import StructMeta
 
-from django_bolt.exceptions import RequestValidationError
+from django_bolt.exceptions import RequestValidationError, SerializationError
 
 from .decorators import (
     ComputedFieldConfig,
@@ -23,7 +45,7 @@ from .decorators import (
     collect_model_validators,
 )
 from .fields import FieldConfig, _FieldMarker
-from .nested import get_nested_config, validate_nested_field
+from .nested import resolve_nested_config, validate_nested_field
 
 # Regex to extract field path from msgspec error messages (e.g., "at `$.field_name`")
 # Borrowed from Litestar's approach
@@ -35,17 +57,72 @@ if TYPE_CHECKING:
     from django.db.models import Model
 
 T = TypeVar("T", bound="Serializer")
+_MISSING = object()
+_USE_DEFAULT = object()
+_STRUCT_META = type(msgspec.Struct)
 
 
-def _is_serializer_type(field_type: Any) -> bool:
-    """Check if a type is a Serializer subclass (for dump fast path detection)."""
-    try:
-        # Check if it's a class and subclass of msgspec.Struct with __is_bolt_serializer__
-        if isinstance(field_type, type):
-            return issubclass(field_type, msgspec.Struct) and getattr(field_type, "__is_bolt_serializer__", False)
-    except TypeError:
-        pass
-    return False
+@dataclass(frozen=True)
+class _ModelOutputNested:
+    """Cached nested output metadata for from_model()/afrom_model()."""
+
+    serializer_class: type[Serializer]
+    many: bool
+    max_items: int | None
+
+
+@dataclass(frozen=True)
+class _ModelFieldSpec:
+    """Cached model extraction metadata for a serializer field."""
+
+    field_name: str
+    source: str | None
+    nested: _ModelOutputNested | None
+    has_default: bool
+
+
+@dataclass(frozen=True)
+class _DumpFieldSpec:
+    """Cached dump metadata for one struct field."""
+
+    field_name: str
+    output_key: str
+    alias: str | None
+    nested: _ModelOutputNested | None
+    default_value: Any = _MISSING
+
+
+@dataclass(frozen=True)
+class _ComputedDumpSpec:
+    """Cached dump metadata for one computed field."""
+
+    field_name: str
+    method_name: str
+
+
+@dataclass(frozen=True)
+class _DjangoRelationInfo:
+    """Lightweight cached description of a Django relation accessor."""
+
+    name: str
+    kind: Literal["forward_one", "reverse_one", "many"]
+    cache_name: str
+    related_model: type[DjangoModel] | None
+    attname: str | None = None
+    reverse_query_attname: str | None = None
+
+
+@dataclass(frozen=True)
+class _UnloadedRelation:
+    """Marker describing a relation path that would require ORM I/O."""
+
+    source: str
+    relation_name: str
+    relation_kind: Literal["forward_one", "reverse_one", "many"]
+
+
+type _RelationTaskCache = dict[tuple[int, str], asyncio.Task[Any]]
+_DJANGO_RELATION_CACHE: WeakKeyDictionary[type, dict[str, _DjangoRelationInfo | None]] = WeakKeyDictionary()
 
 
 def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
@@ -74,7 +151,7 @@ def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
     return result
 
 
-def _build_rename_map(cls: type) -> dict[str, str]:
+def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
     """
     Build field name -> encoded name mapping for msgspec rename support.
 
@@ -99,7 +176,155 @@ def _build_rename_map(cls: type) -> dict[str, str]:
     return rename_map
 
 
-class _SerializerMeta(StructMeta):
+def _resolve_dump_default(default_value: Any) -> Any:
+    """Resolve msgspec/_FieldMarker defaults into their runtime value."""
+    if isinstance(default_value, _FieldMarker) and default_value.config.has_default():
+        return default_value.config.get_default()
+    return default_value
+
+
+def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
+    """Infer nested output behavior from the type hint plus optional Nested() metadata."""
+    nested_config = resolve_nested_config(field_type)
+    if nested_config is None:
+        return None
+
+    return _ModelOutputNested(
+        serializer_class=nested_config.serializer_class,
+        many=nested_config.many,
+        max_items=nested_config.max_items,
+    )
+
+
+def _field_type_may_hold_orm_state(field_type: Any) -> bool:
+    """Return True when a field type could plausibly hold a manager/queryset at runtime."""
+    if field_type in {
+        Any,
+        object,
+        BaseManager,
+        QuerySet,
+        DjangoModel,
+        list,
+        tuple,
+        set,
+        frozenset,
+        dict,
+        Collection,
+        Iterable,
+        Mapping,
+        Sequence,
+    }:
+        return True
+
+    origin = get_origin(field_type)
+    if origin is None:
+        return False
+
+    if origin is Literal:
+        return False
+
+    if origin in {Union, UnionType}:
+        return any(_field_type_may_hold_orm_state(arg) for arg in get_args(field_type) if arg is not type(None))
+
+    if origin is Annotated:
+        args = get_args(field_type)
+        return bool(args) and _field_type_may_hold_orm_state(args[0])
+
+    if origin in {list, tuple, set, frozenset, dict, Collection, Iterable, Mapping, Sequence}:
+        args = tuple(arg for arg in get_args(field_type) if arg not in {type(None), Ellipsis})
+        return not args or any(_field_type_may_hold_orm_state(arg) for arg in args)
+
+    return False
+
+
+def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelationInfo | None:
+    """Return cached Django relation metadata for a model accessor.
+
+    Uses weak model-class keys so dev reloads don't pin stale model classes in memory.
+    """
+    model_cache = _DJANGO_RELATION_CACHE.get(model_cls)
+    if model_cache is None:
+        model_cache = {}
+        _DJANGO_RELATION_CACHE[model_cls] = model_cache
+    elif attr_name in model_cache:
+        return model_cache[attr_name]
+
+    meta = getattr(model_cls, "_meta", None)
+    if meta is None:
+        model_cache[attr_name] = None
+        return None
+
+    try:
+        field = meta.get_field(attr_name)
+    except FieldDoesNotExist:
+        model_cache[attr_name] = None
+        return None
+
+    if not getattr(field, "is_relation", False):
+        model_cache[attr_name] = None
+        return None
+
+    cache_name = attr_name
+    get_cache_name = getattr(field, "get_cache_name", None)
+    if callable(get_cache_name):
+        try:
+            cache_name = get_cache_name()
+        except TypeError:
+            cache_name = attr_name
+
+    related_model = getattr(field, "related_model", None)
+
+    if getattr(field, "auto_created", False) and not getattr(field, "concrete", True):
+        if getattr(field, "one_to_one", False):
+            reverse_field = getattr(field, "field", None)
+            reverse_query_attname = (
+                getattr(reverse_field, "attname", None) or getattr(reverse_field, "name", None)
+            )
+            info = _DjangoRelationInfo(
+                name=attr_name,
+                kind="reverse_one",
+                cache_name=cache_name,
+                related_model=related_model,
+                reverse_query_attname=reverse_query_attname,
+            )
+            model_cache[attr_name] = info
+            return info
+
+        info = _DjangoRelationInfo(
+            name=attr_name,
+            kind="many",
+            cache_name=attr_name,
+            related_model=related_model,
+        )
+        model_cache[attr_name] = info
+        return info
+
+    if getattr(field, "many_to_many", False):
+        info = _DjangoRelationInfo(
+            name=attr_name,
+            kind="many",
+            cache_name=attr_name,
+            related_model=related_model,
+        )
+        model_cache[attr_name] = info
+        return info
+
+    if getattr(field, "one_to_one", False) or getattr(field, "many_to_one", False):
+        info = _DjangoRelationInfo(
+            name=attr_name,
+            kind="forward_one",
+            cache_name=cache_name,
+            related_model=related_model,
+            attname=getattr(field, "attname", None),
+        )
+        model_cache[attr_name] = info
+        return info
+
+    model_cache[attr_name] = None
+    return None
+
+
+class _SerializerMeta(_STRUCT_META):
     """
     Custom metaclass that forces kw_only=True for all Serializer subclasses.
 
@@ -110,12 +335,12 @@ class _SerializerMeta(StructMeta):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
-        cls = super().__new__(mcs, name, bases, namespace, **kwargs)
+        cls = cast(Any, super().__new__(mcs, name, bases, namespace, **kwargs))
 
         # Build rename map (e.g., {"user_name": "userName"} for rename="camel").
         # Done here because __struct_fields__ isn't available in __init_subclass__.
         # If forward references can't be resolved, deferred to _lazy_collect_field_configs.
-        rename_map = _build_rename_map(cls) if hasattr(cls, "__struct_fields__") else {}
+        rename_map = _build_rename_map(cast(type[msgspec.Struct], cls)) if hasattr(cls, "__struct_fields__") else {}
         cls.__rename_map__ = rename_map
         # Fast boolean flag avoids dict truthiness check on every dump()
         cls.__has_rename__ = bool(rename_map)
@@ -123,7 +348,7 @@ class _SerializerMeta(StructMeta):
         return cls
 
 
-class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[misc]
+class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     """
     Enhanced msgspec.Struct with validation and Django model integration.
 
@@ -166,11 +391,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
     __model_validators__: ClassVar[list[Any]] = []
     # Pre-computed tuple of (field_name, validators_tuple) for faster iteration
     __field_validators_tuple__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    _computed_dump_specs: ClassVar[tuple[_ComputedDumpSpec, ...]] = ()
 
     # Cached type hints and metadata (populated by __init_subclass__)
     __cached_type_hints__: ClassVar[dict[str, Any]] = {}
     __nested_fields__: ClassVar[dict[str, Any]] = {}
     __literal_fields__: ClassVar[dict[str, frozenset[Any]]] = {}  # Frozenset for O(1) lookup
+    __model_field_specs__: ClassVar[tuple[_ModelFieldSpec, ...]] = ()
 
     # Field configuration (populated by __init_subclass__)
     __field_configs__: ClassVar[dict[str, FieldConfig]] = {}
@@ -197,6 +424,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
     __default_values_map__: ClassVar[dict[str, Any] | None] = None
     # Fast-path flag for dump: True if dump can use simple/fast path
     __dump_fast_path__: ClassVar[bool] = True
+    __orm_state_check_fields__: ClassVar[tuple[str, ...]] = ()
+    _dump_field_specs: ClassVar[tuple[_DumpFieldSpec, ...]] = ()
+    _dump_field_spec_cache: ClassVar[
+        dict[tuple[frozenset[str] | None, frozenset[str] | None], tuple[_DumpFieldSpec, ...]]
+    ] = {}
+    _computed_dump_spec_cache: ClassVar[
+        dict[tuple[frozenset[str] | None, frozenset[str] | None], tuple[_ComputedDumpSpec, ...]]
+    ] = {}
+    _serializer_view_cache: ClassVar[dict[tuple[frozenset[str] | None, frozenset[str] | None], Any]] = {}
     # Track if any field is a Serializer type (requires recursive dump)
     __has_serializer_fields__: ClassVar[bool] = False
     # Rename mapping: Python field name -> encoded name (e.g., "user_name" -> "userName")
@@ -212,11 +448,22 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         cls.__field_validators__ = collect_field_validators(cls)
         cls.__model_validators__ = collect_model_validators(cls)
         cls.__computed_fields__ = collect_computed_fields(cls)
+        cls._computed_dump_specs = tuple(
+            _ComputedDumpSpec(field_name=field_name, method_name=config.method_name)
+            for field_name, config in cls.__computed_fields__.items()
+        )
 
         # Pre-compute validators as tuple for faster iteration (no dict overhead)
         cls.__field_validators_tuple__ = tuple(
             (field_name, tuple(validators)) for field_name, validators in cls.__field_validators__.items()
         )
+
+        cls.__default_values_map__ = None
+        cls._dump_field_specs = ()
+        cls._dump_field_spec_cache = {}
+        cls._computed_dump_spec_cache = {}
+        cls._serializer_view_cache = {}
+        cls.__orm_state_check_fields__ = ()
 
         # Collect configuration from Meta class (read_only, write_only, field_sets)
         # Note: _FieldMarker processing is deferred to _lazy_collect_field_configs
@@ -244,7 +491,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         # - No computed fields
         # - No write_only fields
         # - No field configs with exclude
-        # - No nested serializer fields (with Nested() annotation)
+        # - No nested serializer fields
         # - No serializer-typed fields (they need recursive dump)
         cls.__dump_fast_path__ = (
             not cls.__has_computed_fields__
@@ -347,10 +594,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         has_serializer_fields = False  # Track if any field is a Serializer (for dump optimization)
 
         for field_name, field_type in hints.items():
-            # Check if field has NestedConfig metadata
-            nested_config = get_nested_config(field_type)
+            # Infer nested serializer behavior from the field type.
+            nested_config = resolve_nested_config(field_type)
             if nested_config is not None:
                 nested_fields[field_name] = nested_config
+                has_serializer_fields = True
 
             # Check if field is a Literal type (for Django choices validation)
             origin = get_origin(field_type)
@@ -358,18 +606,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
                 allowed_values = get_args(field_type)
                 # Convert to frozenset for O(1) membership testing (optimization #3)
                 literal_fields[field_name] = frozenset(allowed_values)
-
-            # Check if field type is a Serializer subclass (for dump fast path)
-            # This handles cases like `address: AddressSerializer` without Nested()
-            if not has_serializer_fields:
-                # Check direct type
-                if _is_serializer_type(field_type):
-                    has_serializer_fields = True
-                # Check list[Serializer]
-                elif origin is list:
-                    args = get_args(field_type)
-                    if args and _is_serializer_type(args[0]):
-                        has_serializer_fields = True
 
         cls.__nested_fields__ = nested_fields
         cls.__literal_fields__ = literal_fields
@@ -388,10 +624,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         if cls.__default_values_map__ is not None:
             return
 
+        cls._ensure_dump_ready()
+
         default_values: dict[str, Any] = {}
-        # Use helper to iterate over (field_name, default_value) pairs
-        for field_name, default_val in _iter_field_defaults(cls):
-            default_values[field_name] = default_val
+        for spec in cls._dump_field_specs:
+            if spec.default_value is not _MISSING:
+                default_values[spec.field_name] = spec.default_value
 
         cls.__default_values_map__ = default_values
 
@@ -499,6 +737,17 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         cls.__write_only_fields__ = cls.__write_only_fields__ | frozenset(write_only)
         cls.__source_mapping__.update(source_mapping)
 
+        default_field_names = {field_name for field_name, _ in _iter_field_defaults(cls)}
+        cls.__model_field_specs__ = tuple(
+            _ModelFieldSpec(
+                field_name=field_name,
+                source=cls.__source_mapping__.get(field_name),
+                nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any)),
+                has_default=field_name in default_field_names,
+            )
+            for field_name in cls.__struct_fields__
+        )
+
         # Update the has_field_markers flag based on actual _FieldMarker defaults found
         cls.__has_field_markers__ = bool(field_configs)
 
@@ -518,6 +767,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
             and not cls.__has_serializer_fields__
             and not any(cfg.exclude for cfg in cls.__field_configs__.values())
         )
+        cls.__orm_state_check_fields__ = tuple(
+            field_name
+            for field_name in cls.__struct_fields__
+            if _field_type_may_hold_orm_state(cls.__cached_type_hints__.get(field_name, Any))
+        )
+        cls._dump_field_specs = cls._build_dump_field_specs()
+        cls._dump_field_spec_cache.clear()
+        cls._computed_dump_spec_cache.clear()
+        cls._serializer_view_cache.clear()
+        cls.__default_values_map__ = None
 
         # Mark as collected so we don't run again
         cls.__field_configs_collected__ = True
@@ -576,7 +835,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         Validate nested serializer fields and Literal (choice) fields using cached metadata.
 
         This method handles two types of validation:
-        1. Nested fields: Fields with Nested() annotation that contain serializer instances
+        1. Nested fields: Fields whose type resolves to a nested serializer
         2. Literal fields: Fields with Literal[] type hints that restrict values to specific choices
 
         Returns:
@@ -802,6 +1061,521 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
             raise
 
     @classmethod
+    def _ensure_from_model_ready(cls) -> None:
+        """Ensure lazy field metadata has been collected before model extraction."""
+        if not cls.__field_configs_collected__:
+            cls._lazy_collect_field_configs()
+
+    @classmethod
+    def _ensure_dump_ready(cls) -> None:
+        """Ensure lazy field metadata has been collected before dumping/views."""
+        if not cls.__field_configs_collected__:
+            cls._lazy_collect_field_configs()
+
+    @classmethod
+    def _build_dump_field_specs(cls) -> tuple[_DumpFieldSpec, ...]:
+        """Pre-compute dump metadata for struct fields."""
+        default_values = {
+            field_name: _resolve_dump_default(default_value) for field_name, default_value in _iter_field_defaults(cls)
+        }
+        nested_fields = cls.__nested_fields__
+        rename_map = cls.__rename_map__
+        specs: list[_DumpFieldSpec] = []
+
+        for field_name in cls.__struct_fields__:
+            if field_name in cls.__write_only_fields__:
+                continue
+
+            field_config = cls.__field_configs__.get(field_name)
+            if field_config and field_config.exclude:
+                continue
+
+            specs.append(
+                _DumpFieldSpec(
+                    field_name=field_name,
+                    output_key=rename_map.get(field_name, field_name),
+                    alias=field_config.alias if field_config else None,
+                    nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any))
+                    if field_name in nested_fields
+                    else None,
+                    default_value=default_values.get(field_name, _MISSING),
+                )
+            )
+
+        return tuple(specs)
+
+    @classmethod
+    def _get_dump_field_specs(
+        cls,
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> tuple[_DumpFieldSpec, ...]:
+        """Return cached dump field specs for the requested field filter."""
+        cls._ensure_dump_ready()
+        if include_fields is None and exclude_fields is None:
+            return cls._dump_field_specs
+
+        cache_key = (include_fields, exclude_fields)
+        specs = cls._dump_field_spec_cache.get(cache_key)
+        if specs is None:
+            specs = tuple(
+                spec
+                for spec in cls._dump_field_specs
+                if (include_fields is None or spec.field_name in include_fields)
+                and (exclude_fields is None or spec.field_name not in exclude_fields)
+            )
+            cls._dump_field_spec_cache[cache_key] = specs
+        return specs
+
+    @classmethod
+    def _get_computed_dump_specs(
+        cls,
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> tuple[_ComputedDumpSpec, ...]:
+        """Return cached computed-field specs for the requested field filter."""
+        cls._ensure_dump_ready()
+        if include_fields is None and exclude_fields is None:
+            return cls._computed_dump_specs
+
+        cache_key = (include_fields, exclude_fields)
+        specs = cls._computed_dump_spec_cache.get(cache_key)
+        if specs is None:
+            specs = tuple(
+                spec
+                for spec in cls._computed_dump_specs
+                if (include_fields is None or spec.field_name in include_fields)
+                and (exclude_fields is None or spec.field_name not in exclude_fields)
+            )
+            cls._computed_dump_spec_cache[cache_key] = specs
+        return specs
+
+    @classmethod
+    def _get_cached_view(
+        cls: type[T],
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> SerializerView[T]:
+        """Return a cached SerializerView for a given field-selection pair."""
+        cls._ensure_dump_ready()
+        cache_key = (include_fields, exclude_fields)
+        cached = cls._serializer_view_cache.get(cache_key)
+        if cached is None:
+            cached = SerializerView(cls, include_fields=include_fields, exclude_fields=exclude_fields)
+            cls._serializer_view_cache[cache_key] = cached
+        return cast("SerializerView[T]", cached)
+
+    @classmethod
+    def _relation_loading_hint(cls, relation: _DjangoRelationInfo) -> str:
+        """Return the recommended Django ORM hint for preloading a relation."""
+        if relation.kind == "many":
+            return f"prefetch_related('{relation.name}')"
+        return f"select_related('{relation.name}')"
+
+    @classmethod
+    def _raise_unloaded_relation_error(
+        cls,
+        *,
+        field_name: str,
+        relation: _UnloadedRelation,
+        instance: Any,
+    ) -> None:
+        """Raise a descriptive error when sync from_model() would need ORM I/O."""
+        raise SerializationError(
+            f"{cls.__name__}.{field_name} requires loaded relation '{relation.source}' on "
+            f"{instance.__class__.__name__} when using from_model(). Preload it with "
+            f"{cls._relation_loading_hint(_DjangoRelationInfo(relation.relation_name, relation.relation_kind, relation.relation_name, None))} "
+            f"or use await {cls.__name__}.afrom_model(instance)."
+        )
+
+    @staticmethod
+    def _normalize_many_relation_value(value: Any) -> list[Any]:
+        """Normalize prefetched many-relation values into a concrete list."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, (BaseManager, QuerySet)):
+            return list(value)
+        if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
+            return list(value)
+        return [value]
+
+    @classmethod
+    def _get_loaded_relation_sync(cls, obj: DjangoModel, relation: _DjangoRelationInfo) -> Any:
+        """Read a relation only if Django already has it cached on the instance."""
+        state = getattr(obj, "_state", None)
+        fields_cache = getattr(state, "fields_cache", {}) if state is not None else {}
+
+        if relation.kind in {"forward_one", "reverse_one"}:
+            for key in (relation.cache_name, relation.name):
+                if key in fields_cache:
+                    return fields_cache[key]
+                if key in getattr(obj, "__dict__", {}):
+                    return obj.__dict__[key]
+            return _MISSING
+
+        prefetch_cache = getattr(obj, "_prefetched_objects_cache", None)
+        if isinstance(prefetch_cache, dict):
+            for key in (relation.cache_name, relation.name):
+                if key in prefetch_cache:
+                    return cls._normalize_many_relation_value(prefetch_cache[key])
+        return _MISSING
+
+    @staticmethod
+    def _cache_loaded_relation(obj: DjangoModel, relation: _DjangoRelationInfo, value: Any) -> None:
+        """Store async-loaded relations back on the Django instance for reuse."""
+        if relation.kind == "many":
+            cache = getattr(obj, "_prefetched_objects_cache", None)
+            if cache is None:
+                cache = {}
+                obj._prefetched_objects_cache = cache
+            cache[relation.cache_name] = list(value) if isinstance(value, list) else value
+            return
+
+        state = getattr(obj, "_state", None)
+        if state is not None:
+            fields_cache = getattr(state, "fields_cache", None)
+            if fields_cache is not None:
+                fields_cache[relation.cache_name] = value
+                return
+        obj.__dict__[relation.cache_name] = value
+
+    @classmethod
+    async def _load_relation_async(cls, obj: DjangoModel, relation: _DjangoRelationInfo) -> Any:
+        """Load a relation through Django's async ORM when afrom_model() is used."""
+        related_model = relation.related_model
+        if related_model is None:
+            return None
+        related_model_cls = cast(Any, related_model)
+
+        if relation.kind == "forward_one":
+            if relation.attname is None:
+                return None
+            related_id = getattr(obj, relation.attname, None)
+            if related_id is None:
+                return None
+            value = await related_model_cls.objects.aget(pk=related_id)
+            cls._cache_loaded_relation(obj, relation, value)
+            return value
+
+        if relation.kind == "reverse_one":
+            if relation.reverse_query_attname is None:
+                return None
+            try:
+                value = await related_model_cls.objects.aget(**{relation.reverse_query_attname: obj.pk})
+            except related_model_cls.DoesNotExist:
+                value = None
+            cls._cache_loaded_relation(obj, relation, value)
+            return value
+
+        manager = getattr(obj, relation.name)
+        value = [item async for item in manager.all()]
+        cls._cache_loaded_relation(obj, relation, value)
+        return value
+
+    @classmethod
+    async def _get_or_load_relation_async(
+        cls,
+        obj: DjangoModel,
+        relation: _DjangoRelationInfo,
+        *,
+        relation_tasks: _RelationTaskCache,
+    ) -> Any:
+        """Reuse in-flight relation loads so gathered field extraction doesn't duplicate queries."""
+        loaded_value = cls._get_loaded_relation_sync(obj, relation)
+        if loaded_value is not _MISSING:
+            return loaded_value
+
+        cache_key = (id(obj), relation.cache_name)
+        task = relation_tasks.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(cls._load_relation_async(obj, relation))
+            relation_tasks[cache_key] = task
+
+        try:
+            return await task
+        except Exception:
+            if relation_tasks.get(cache_key) is task:
+                relation_tasks.pop(cache_key, None)
+            raise
+
+    @classmethod
+    def _resolve_source_sync(
+        cls,
+        obj: Any,
+        source: str,
+        *,
+        nested_output: _ModelOutputNested | None,
+    ) -> Any:
+        """Resolve a dot-path without triggering ORM I/O."""
+        parts = source.split(".")
+        current = obj
+
+        for idx, part in enumerate(parts):
+            if current is None:
+                return None
+
+            is_last = idx == len(parts) - 1
+            relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
+
+            if relation is not None:
+                if is_last and nested_output is None and relation.kind == "forward_one" and relation.attname is not None:
+                    return getattr(current, relation.attname, None)
+
+                loaded_value = cls._get_loaded_relation_sync(current, relation)
+                if loaded_value is _MISSING:
+                    return _UnloadedRelation(
+                        source=".".join(parts[: idx + 1]),
+                        relation_name=relation.name,
+                        relation_kind=relation.kind,
+                    )
+                current = loaded_value
+                continue
+
+            if isinstance(current, dict):
+                if part not in current:
+                    return _MISSING
+                current = current[part]
+                continue
+
+            if isinstance(current, list):
+                return _MISSING
+
+            if not hasattr(current, part):
+                return _MISSING
+            current = getattr(current, part)
+
+        return current
+
+    @classmethod
+    async def _resolve_source_async(
+        cls,
+        obj: Any,
+        source: str,
+        *,
+        nested_output: _ModelOutputNested | None,
+        relation_tasks: _RelationTaskCache,
+    ) -> Any:
+        """Resolve a dot-path, loading relations through Django's async ORM as needed."""
+        parts = source.split(".")
+        current = obj
+
+        for idx, part in enumerate(parts):
+            if current is None:
+                return None
+
+            is_last = idx == len(parts) - 1
+            relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
+
+            if relation is not None:
+                if is_last and nested_output is None and relation.kind == "forward_one" and relation.attname is not None:
+                    return getattr(current, relation.attname, None)
+
+                loaded_value = cls._get_loaded_relation_sync(current, relation)
+                if loaded_value is _MISSING:
+                    loaded_value = await cls._get_or_load_relation_async(
+                        current,
+                        relation,
+                        relation_tasks=relation_tasks,
+                    )
+                current = loaded_value
+                continue
+
+            if isinstance(current, dict):
+                if part not in current:
+                    return _MISSING
+                current = current[part]
+                continue
+
+            if isinstance(current, list):
+                return _MISSING
+
+            if not hasattr(current, part):
+                return _MISSING
+            current = getattr(current, part)
+
+        return current
+
+    @classmethod
+    def _convert_regular_from_model_value(cls, value: Any, *, field_name: str) -> Any:
+        """Convert ORM-ish values into regular serializer output values."""
+        if isinstance(value, DjangoModel):
+            return value.pk
+        if isinstance(value, (BaseManager, QuerySet)):
+            raise SerializationError(
+                f"{cls.__name__}.{field_name} still contains {value.__class__.__name__}; "
+                "from_model() must resolve Django managers/querysets before dump()."
+            )
+        if isinstance(value, list) and value and isinstance(value[0], DjangoModel):
+            return [item.pk for item in value]
+        return value
+
+    @classmethod
+    def _validate_nested_item_limit(
+        cls,
+        *,
+        field_name: str,
+        nested_output: _ModelOutputNested,
+        item_count: int,
+    ) -> None:
+        """Enforce nested list size limits for output serialization too."""
+        if nested_output.max_items is not None and item_count > nested_output.max_items:
+            raise SerializationError(
+                f"{cls.__name__}.{field_name} resolved {item_count} nested items. "
+                f"Maximum allowed: {nested_output.max_items}."
+            )
+
+    @classmethod
+    def _convert_nested_from_model_value(
+        cls,
+        value: Any,
+        *,
+        field_name: str,
+        nested_output: _ModelOutputNested,
+        _depth: int,
+        max_depth: int,
+    ) -> Any:
+        """Convert nested model values for sync from_model()."""
+        serializer_class = nested_output.serializer_class
+
+        if value is None:
+            return None
+
+        if nested_output.many:
+            items = cls._normalize_many_relation_value(value)
+            cls._validate_nested_item_limit(field_name=field_name, nested_output=nested_output, item_count=len(items))
+
+            result = []
+            for item in items:
+                if isinstance(item, serializer_class):
+                    result.append(item)
+                elif isinstance(item, DjangoModel):
+                    result.append(serializer_class.from_model(item, _depth=_depth + 1, max_depth=max_depth))
+                elif isinstance(item, dict):
+                    result.append(serializer_class(**item))
+                else:
+                    result.append(item)
+            return result
+
+        if isinstance(value, serializer_class):
+            return value
+        if isinstance(value, DjangoModel):
+            return serializer_class.from_model(value, _depth=_depth + 1, max_depth=max_depth)
+        if isinstance(value, dict):
+            return serializer_class(**value)
+        return value
+
+    @classmethod
+    async def _convert_nested_from_model_value_async(
+        cls,
+        value: Any,
+        *,
+        field_name: str,
+        nested_output: _ModelOutputNested,
+        _depth: int,
+        max_depth: int,
+    ) -> Any:
+        """Convert nested model values for async afrom_model()."""
+        serializer_class = nested_output.serializer_class
+
+        if value is None:
+            return None
+
+        if nested_output.many:
+            items = cls._normalize_many_relation_value(value)
+            cls._validate_nested_item_limit(field_name=field_name, nested_output=nested_output, item_count=len(items))
+
+            async def convert_item(item: Any) -> Any:
+                if isinstance(item, serializer_class):
+                    return item
+                if isinstance(item, DjangoModel):
+                    return await serializer_class.afrom_model(item, _depth=_depth + 1, max_depth=max_depth)
+                if isinstance(item, dict):
+                    return serializer_class(**item)
+                return item
+
+            return list(await asyncio.gather(*(convert_item(item) for item in items)))
+
+        if isinstance(value, serializer_class):
+            return value
+        if isinstance(value, DjangoModel):
+            return await serializer_class.afrom_model(value, _depth=_depth + 1, max_depth=max_depth)
+        if isinstance(value, dict):
+            return serializer_class(**value)
+        return value
+
+    @classmethod
+    def _extract_model_field_sync(
+        cls,
+        instance: Any,
+        spec: _ModelFieldSpec,
+        *,
+        _depth: int,
+        max_depth: int,
+    ) -> Any:
+        """Extract one serializer field from a model/object without ORM I/O."""
+        source = spec.source or spec.field_name
+        value = cls._resolve_source_sync(instance, source, nested_output=spec.nested)
+
+        if value is _MISSING:
+            return _USE_DEFAULT if spec.has_default else _MISSING
+
+        if isinstance(value, _UnloadedRelation):
+            if spec.has_default:
+                return _USE_DEFAULT
+            cls._raise_unloaded_relation_error(field_name=spec.field_name, relation=value, instance=instance)
+
+        if spec.nested is not None:
+            return cls._convert_nested_from_model_value(
+                value,
+                field_name=spec.field_name,
+                nested_output=spec.nested,
+                _depth=_depth,
+                max_depth=max_depth,
+            )
+
+        return cls._convert_regular_from_model_value(value, field_name=spec.field_name)
+
+    @classmethod
+    async def _extract_model_field_async(
+        cls,
+        instance: Any,
+        spec: _ModelFieldSpec,
+        *,
+        _depth: int,
+        max_depth: int,
+        relation_tasks: _RelationTaskCache,
+    ) -> Any:
+        """Extract one serializer field from a model/object with async ORM support."""
+        source = spec.source or spec.field_name
+        value = await cls._resolve_source_async(
+            instance,
+            source,
+            nested_output=spec.nested,
+            relation_tasks=relation_tasks,
+        )
+
+        if value is _MISSING:
+            return _USE_DEFAULT if spec.has_default else _MISSING
+
+        if spec.nested is not None:
+            return await cls._convert_nested_from_model_value_async(
+                value,
+                field_name=spec.field_name,
+                nested_output=spec.nested,
+                _depth=_depth,
+                max_depth=max_depth,
+            )
+
+        return cls._convert_regular_from_model_value(value, field_name=spec.field_name)
+
+    @classmethod
     def from_model(
         cls: type[T],
         instance: Model,
@@ -842,81 +1616,55 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
                 f"Consider using separate serializers with ID-only fields for deeply nested relationships."
             )
 
-        # Ensure field configs are collected (populates __source_mapping__)
-        # This is normally done lazily in __post_init__, but we need it before creating the instance
-        if not cls.__field_configs_collected__:
-            cls._lazy_collect_field_configs()
+        cls._ensure_from_model_ready()
 
-        # Use cached nested field metadata (no expensive introspection!)
         data = {}
-        source_mapping = cls.__source_mapping__
+        for spec in cls.__model_field_specs__:
+            value = cls._extract_model_field_sync(instance, spec, _depth=_depth, max_depth=max_depth)
+            if value is _MISSING or value is _USE_DEFAULT:
+                continue
+            data[spec.field_name] = value
 
-        for field_name in cls.__struct_fields__:
-            # Check if this field has a source mapping (field uses a different model attribute)
-            source = source_mapping.get(field_name)
+        return cls(**data)
 
-            if source:
-                # Use the source path to get the value from the model
-                value = cls._get_value_from_source(instance, source)
-                # Skip if source root attribute doesn't exist (vs. exists but is None)
-                if value is None and not hasattr(instance, source.split(".")[0]):
-                    continue
-            else:
-                # No source mapping - use field name directly
-                if not hasattr(instance, field_name):
-                    continue
-                value = getattr(instance, field_name)
+    @classmethod
+    async def afrom_model(
+        cls: type[T],
+        instance: Model,
+        *,
+        _depth: int = 0,
+        max_depth: int = 10,
+    ) -> T:
+        """Async variant of from_model() that may lazy-load relations safely."""
+        if _depth > max_depth:
+            raise ValueError(
+                f"Maximum recursion depth ({max_depth}) exceeded in afrom_model(). "
+                f"This usually indicates overly deep nesting or circular references. "
+                f"Current serializer: {cls.__name__}, instance: {instance.__class__.__name__}(pk={instance.pk}). "
+                f"Consider using separate serializers with ID-only fields for deeply nested relationships."
+            )
 
-            # Check if this field has a nested serializer (from cache!)
-            nested_config = cls.__nested_fields__.get(field_name)
+        cls._ensure_from_model_ready()
 
-            if nested_config:
-                # This field is a nested serializer - extract full object data
-                if nested_config.many:
-                    # Many-to-many or reverse relationship
-                    if hasattr(value, "all") and callable(getattr(value, "all", None)):
-                        # Convert each related object to a dict for the nested serializer
-                        items = []
-                        for item in value.all():
-                            if isinstance(item, DjangoModel):
-                                # Recursively call from_model with depth tracking
-                                items.append(
-                                    nested_config.serializer_class.from_model(
-                                        item,
-                                        _depth=_depth + 1,
-                                        max_depth=max_depth,
-                                    )
-                                )
-                        data[field_name] = items
-                    elif isinstance(value, list):
-                        data[field_name] = value
-                    else:
-                        data[field_name] = []
-                else:
-                    # Single nested object (ForeignKey)
-                    if isinstance(value, DjangoModel):
-                        # Convert to nested serializer with depth tracking
-                        data[field_name] = nested_config.serializer_class.from_model(
-                            value,
-                            _depth=_depth + 1,
-                            max_depth=max_depth,
-                        )
-                    else:
-                        data[field_name] = value
-            else:
-                # Regular field - not nested
-                if isinstance(value, DjangoModel):
-                    # Related object without nested serializer - use ID
-                    data[field_name] = value.pk
-                elif hasattr(value, "all") and callable(getattr(value, "all", None)):
-                    # Manager without nested serializer - extract IDs
-                    try:
-                        data[field_name] = [item.pk for item in value.all()]
-                    except Exception:
-                        data[field_name] = value
-                else:
-                    # Regular field
-                    data[field_name] = value
+        relation_tasks: _RelationTaskCache = {}
+        values = await asyncio.gather(
+            *(
+                cls._extract_model_field_async(
+                    instance,
+                    spec,
+                    _depth=_depth,
+                    max_depth=max_depth,
+                    relation_tasks=relation_tasks,
+                )
+                for spec in cls.__model_field_specs__
+            )
+        )
+
+        data = {}
+        for spec, value in zip(cls.__model_field_specs__, values, strict=False):
+            if value is _MISSING or value is _USE_DEFAULT:
+                continue
+            data[spec.field_name] = value
 
         return cls(**data)
 
@@ -979,13 +1727,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         omit_defaults = self.__struct_config__.omit_defaults
 
         # Get field defaults if omit_defaults is enabled
-        defaults = self.__struct_defaults__ if omit_defaults else None
+        default_values = dict(_iter_field_defaults(type(self))) if omit_defaults else {}
 
-        for idx, field_name in enumerate(self.__struct_fields__):
+        for field_name in self.__struct_fields__:
             value = getattr(self, field_name)
 
             # Skip fields that are at their default value if omit_defaults is True
-            if omit_defaults and defaults is not None and value == defaults[idx]:
+            if omit_defaults and field_name in default_values and value == default_values[field_name]:
                 continue
 
             setattr(instance, field_name, value)
@@ -1158,7 +1906,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
 
         # Add from_parent class method
         @classmethod
-        def from_parent(new_cls_ref: type[T], instance: Serializer) -> T:  # type: ignore
+        def from_parent(new_cls_ref: type[T], instance: Serializer) -> T:
             """Create instance from a parent serializer instance."""
             data = {}
             for field_name in new_cls_ref.__struct_fields__:
@@ -1166,7 +1914,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
                     data[field_name] = getattr(instance, field_name)
             return new_cls_ref(**data)
 
-        new_cls.from_parent = from_parent  # type: ignore
+        cast(Any, new_cls).from_parent = from_parent
 
         return new_cls
 
@@ -1249,7 +1997,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
             # Chain with dump_many for lists
             UserSerializer.only("id", "email").dump_many(users)
         """
-        return SerializerView(cls, include_fields=frozenset(fields))
+        return cls._get_cached_view(include_fields=frozenset(fields))
 
     @classmethod
     def exclude(cls: type[T], *fields: str) -> SerializerView[T]:
@@ -1272,7 +2020,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
             # Chain with dump_many for lists
             UserSerializer.exclude("internal_notes").dump_many(users)
         """
-        return SerializerView(cls, exclude_fields=frozenset(fields))
+        return cls._get_cached_view(exclude_fields=frozenset(fields))
 
     @classmethod
     def use(cls: type[T], field_set: str) -> SerializerView[T]:
@@ -1315,7 +2063,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
                 f"Field set '{field_set}' not found in {cls.__name__}.Config.field_sets. "
                 f"Available field sets: {available}"
             )
-        return SerializerView(cls, include_fields=frozenset(field_sets[field_set]))
+        return cls._get_cached_view(include_fields=frozenset(field_sets[field_set]))
 
     # -------------------------------------------------------------------------
     # Dump Methods (Serialization)
@@ -1351,12 +2099,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         """
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         cls = self.__class__
+        cls._ensure_dump_ready()
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
+            if cls.__orm_state_check_fields__:
+                self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
             if cls.__has_rename__:
                 return msgspec.to_builtins(self)
             return msgspec_structs.asdict(self)
 
-        # SLOW PATH: Need special handling
+        # SLOW PATH: Need special handling.
         return self._dump_impl(
             exclude_none=exclude_none,
             exclude_unset=exclude_unset,
@@ -1375,109 +2126,96 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
         by_alias: bool = False,
         include_fields: frozenset[str] | None = None,
         exclude_fields: frozenset[str] | None = None,
+        field_specs: tuple[_DumpFieldSpec, ...] | None = None,
+        computed_specs: tuple[_ComputedDumpSpec, ...] | None = None,
     ) -> dict[str, Any]:
         """Internal implementation of dump with field filtering."""
-        # Cache class attributes locally for faster access in the loop
         cls = self.__class__
-        struct_fields = cls.__struct_fields__
-        write_only_fields = cls.__write_only_fields__
-        field_configs = cls.__field_configs__
-        has_computed = cls.__has_computed_fields__
-        computed_fields = cls.__computed_fields__
-        rename_map = cls.__rename_map__
-
-        # Use pre-computed default values map (computed once per class, not per call)
-        default_values = None
-        if exclude_defaults:
-            # Lazy cache the default values map on first use (None = not cached)
-            if cls.__default_values_map__ is None:
-                cls._cache_default_values_map()
-            default_values = cls.__default_values_map__
+        cls._ensure_dump_ready()
+        field_specs = (
+            field_specs
+            if field_specs is not None
+            else cls._get_dump_field_specs(include_fields=include_fields, exclude_fields=exclude_fields)
+        )
+        computed_specs = (
+            computed_specs
+            if computed_specs is not None
+            else cls._get_computed_dump_specs(include_fields=include_fields, exclude_fields=exclude_fields)
+        )
 
         result: dict[str, Any] = {}
 
         # Local reference to getattr for micro-optimization
         _getattr = getattr
 
-        for field_name in struct_fields:
-            # Skip write_only fields (they shouldn't appear in output)
-            if field_name in write_only_fields:
-                continue
-
-            # Apply include/exclude filtering
-            if include_fields is not None and field_name not in include_fields:
-                continue
-            if exclude_fields is not None and field_name in exclude_fields:
-                continue
-
-            # Check field config for exclusion
-            field_config = field_configs.get(field_name)
-            if field_config and field_config.exclude:
-                continue
-
-            value = _getattr(self, field_name)
+        for spec in field_specs:
+            value = _getattr(self, spec.field_name)
 
             # Skip None values if exclude_none
             if exclude_none and value is None:
                 continue
 
-            # Skip default values if exclude_defaults (using pre-computed map)
-            if default_values is not None and field_name in default_values and value == default_values[field_name]:
+            if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
                 continue
 
             # Determine output key: by_alias takes precedence, then rename_map
-            if by_alias and field_config and field_config.alias:
-                output_key = field_config.alias
-            else:
-                # rename_map.get() returns field_name if not in map (works for empty dict too)
-                output_key = rename_map.get(field_name, field_name)
+            output_key = spec.alias if by_alias and spec.alias else spec.output_key
 
-            # Handle nested serializers
-            if isinstance(value, Serializer):
-                result[output_key] = value.dump(
-                    exclude_none=exclude_none,
-                    exclude_unset=exclude_unset,
-                    exclude_defaults=exclude_defaults,
-                    by_alias=by_alias,
+            if isinstance(value, (BaseManager, QuerySet)):
+                raise SerializationError(
+                    f"{cls.__name__}.{spec.field_name} contains {value.__class__.__name__}. "
+                    "Serialize Django relations with from_model()/afrom_model() before dump()."
                 )
-            elif isinstance(value, list):
-                # Check if it's a list of serializers
-                if value and isinstance(value[0], Serializer):
-                    result[output_key] = [
-                        item.dump(
-                            exclude_none=exclude_none,
-                            exclude_unset=exclude_unset,
-                            exclude_defaults=exclude_defaults,
-                            by_alias=by_alias,
-                        )
-                        for item in value
-                    ]
+
+            if spec.nested is not None:
+                if spec.nested.many:
+                    if isinstance(value, list) and value and isinstance(value[0], Serializer):
+                        result[output_key] = [
+                            item.dump(
+                                exclude_none=exclude_none,
+                                exclude_unset=exclude_unset,
+                                exclude_defaults=exclude_defaults,
+                                by_alias=by_alias,
+                            )
+                            for item in value
+                        ]
+                    else:
+                        result[output_key] = value
+                elif isinstance(value, Serializer):
+                    result[output_key] = value.dump(
+                        exclude_none=exclude_none,
+                        exclude_unset=exclude_unset,
+                        exclude_defaults=exclude_defaults,
+                        by_alias=by_alias,
+                    )
                 else:
                     result[output_key] = value
             else:
                 result[output_key] = value
 
         # Add computed fields
-        if has_computed:
-            for field_name, config in computed_fields.items():
-                # Apply include/exclude filtering to computed fields too
-                if include_fields is not None and field_name not in include_fields:
+        for spec in computed_specs:
+            method = _getattr(self, spec.method_name, None)
+            if method is not None:
+                value = method()
+
+                if exclude_none and value is None:
                     continue
-                if exclude_fields is not None and field_name in exclude_fields:
-                    continue
 
-                # Get the method and call it
-                method = _getattr(self, config.method_name, None)
-                if method is not None:
-                    value = method()
-
-                    # Skip None values if exclude_none
-                    if exclude_none and value is None:
-                        continue
-
-                    result[field_name] = value
+                result[spec.field_name] = value
 
         return result
+
+    def _ensure_dumpable_orm_state(self, field_names: tuple[str, ...] | None = None) -> None:
+        """Fail fast if ORM manager/queryset objects leaked into serializer state."""
+        cls = self.__class__
+        for field_name in field_names or cls.__struct_fields__:
+            value = getattr(self, field_name)
+            if isinstance(value, (BaseManager, QuerySet)):
+                raise SerializationError(
+                    f"{cls.__name__}.{field_name} contains {value.__class__.__name__}. "
+                    "Serialize Django relations with from_model()/afrom_model() before dump()."
+                )
 
     def dump_json(
         self,
@@ -1536,13 +2274,19 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
             users = [UserSerializer.from_model(u) for u in User.objects.all()]
             UserSerializer.dump_many(users)
         """
+        cls._ensure_dump_ready()
+        instances_list = list(instances)
+
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
+            if cls.__orm_state_check_fields__:
+                for instance in instances_list:
+                    instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
             if cls.__has_rename__:
                 _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances]
+                return [_to_builtins(instance) for instance in instances_list]
             _asdict = msgspec_structs.asdict
-            return [_asdict(instance) for instance in instances]
+            return [_asdict(instance) for instance in instances_list]
 
         # SLOW PATH: Need special handling (computed fields, write_only, exclude_*, etc.)
         return [
@@ -1552,7 +2296,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):  # type: ignore[mis
                 exclude_defaults=exclude_defaults,
                 by_alias=by_alias,
             )
-            for instance in instances
+            for instance in instances_list
         ]
 
     @classmethod
@@ -1642,6 +2386,8 @@ class SerializerView(Iterable[T]):
         view.from_model(user_instance)
     """
 
+    __slots__ = ("_serializer_class", "_include_fields", "_exclude_fields", "_field_specs", "_computed_specs")
+
     def __init__(
         self,
         serializer_class: type[T],
@@ -1652,6 +2398,14 @@ class SerializerView(Iterable[T]):
         self._serializer_class = serializer_class
         self._include_fields = include_fields
         self._exclude_fields = exclude_fields
+        self._field_specs = serializer_class._get_dump_field_specs(
+            include_fields=include_fields,
+            exclude_fields=exclude_fields,
+        )
+        self._computed_specs = serializer_class._get_computed_dump_specs(
+            include_fields=include_fields,
+            exclude_fields=exclude_fields,
+        )
 
     def __iter__(self):
         """Allow iteration (returns empty iterator - use dump_many instead)."""
@@ -1663,8 +2417,7 @@ class SerializerView(Iterable[T]):
         if self._include_fields is not None:
             # Intersection with existing include
             new_include = self._include_fields & new_include
-        return SerializerView(
-            self._serializer_class,
+        return self._serializer_class._get_cached_view(
             include_fields=new_include,
             exclude_fields=self._exclude_fields,
         )
@@ -1674,8 +2427,7 @@ class SerializerView(Iterable[T]):
         new_exclude = frozenset(fields)
         if self._exclude_fields is not None:
             new_exclude = self._exclude_fields | new_exclude
-        return SerializerView(
-            self._serializer_class,
+        return self._serializer_class._get_cached_view(
             include_fields=self._include_fields,
             exclude_fields=new_exclude,
         )
@@ -1683,6 +2435,10 @@ class SerializerView(Iterable[T]):
     def from_model(self, instance: Model, **kwargs) -> T:
         """Create a serializer instance from a Django model."""
         return self._serializer_class.from_model(instance, **kwargs)
+
+    async def afrom_model(self, instance: Model, **kwargs) -> T:
+        """Create a serializer instance from a Django model using async ORM loading."""
+        return await self._serializer_class.afrom_model(instance, **kwargs)
 
     def dump(
         self,
@@ -1713,6 +2469,8 @@ class SerializerView(Iterable[T]):
             by_alias=by_alias,
             include_fields=self._include_fields,
             exclude_fields=self._exclude_fields,
+            field_specs=self._field_specs,
+            computed_specs=self._computed_specs,
         )
 
     def dump_many(

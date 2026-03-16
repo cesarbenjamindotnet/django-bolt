@@ -66,8 +66,8 @@ class ProductSerializer(Serializer):
     tags: list[str] = field(default_factory=list)
 
     # Nested serializers
-    author: Annotated[AuthorSerializer | None, Nested(AuthorSerializer)] = None
-    related: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)] = field(default_factory=list)
+    author: AuthorSerializer | None = None
+    related: list[TagSerializer] = field(default_factory=list)
 
     class Config:
         read_only = {"id"}

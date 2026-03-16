@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from django.db import models
 
@@ -49,7 +49,12 @@ def create_serializer(
     read_only = read_only or set()
 
     # Get all model fields
-    model_fields = {f.name: f for f in model._meta.get_fields()}
+    model_meta = cast(Any, model)._meta
+    model_fields = {
+        field.name: field
+        for field in model_meta.get_fields()
+        if isinstance(field, models.Field) and field.name is not None
+    }
 
     # Determine which fields to include
     fields_to_include = set(fields) if fields is not None else set(model_fields.keys())
@@ -78,19 +83,19 @@ def create_serializer(
     class_name = serializer_name or f"{model.__name__}Serializer"
 
     # Create the class
-    attrs = {
+    attrs: dict[str, Any] = {
         "__annotations__": annotations,
         "__doc__": f"Auto-generated serializer for {model.__name__}",
         "__module__": model.__module__,
     }
 
-    # Add Meta class with model reference
-    meta_attrs = {
+    # Add Config class with model reference
+    config_attrs = {
         "model": model,
         "write_only": write_only,
         "read_only": read_only,
     }
-    attrs["Meta"] = type("Meta", (), meta_attrs)
+    attrs["Config"] = type("Config", (), config_attrs)
 
     # Create and return the Serializer class
     serializer_class = type(class_name, (Serializer,), attrs)

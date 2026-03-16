@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mission Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #1a1a2e; color: #eee; }
+        h1 { color: #00d4ff; }
+        .mission { background: #16213e; padding: 15px; margin: 10px 0; border-radius: 8px; }
+        .status { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+        .planned { background: #ffc107; color: #000; }
+        .active { background: #28a745; }
+        .completed { background: #6c757d; }
+        .aborted { background: #dc3545; }
+    </style>
+</head>
+<body>
+    <h1>Mission Dashboard</h1>
+    <p>Total missions: {{ missions|length }}</p>
+    {% for mission in missions %}
+    <div class="mission">
+        <strong>{{ mission.name }}</strong>
+        <span class="status {{ mission.status }}">{{ mission.status|upper }}</span>
+        <p>{{ mission.description|default:"No description" }}</p>
+    </div>
+    {% empty %}
+    <p>No missions found.</p>
+    {% endfor %}
+</body>
+</html>

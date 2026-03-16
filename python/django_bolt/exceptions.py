@@ -100,6 +100,10 @@ class ValidationException(BoltException, ValueError):
         return self._errors
 
 
+class SerializationError(BoltException, ValueError):
+    """Server-side serialization misuse or unsupported serializer state."""
+
+
 class RequestValidationError(ValidationException):
     """Request data validation error.
 

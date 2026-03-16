@@ -326,3 +326,71 @@ class TestCookieStructEndpoints:
         data = response.json()
         assert data["theme"] == "dark"
         assert data["language"] == "en"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAdditionalMissionRoutes:
+    """Test tutorial-style routes that are also exposed in the example app."""
+
+    def test_mission_control_status(self, client):
+        """GET /mission-control returns the mission status payload."""
+        response = client.get("/mission-control")
+        assert response.status_code == 200
+        assert response.json() == {"status": "operational", "message": "Mission Control Online"}
+
+    def test_classified_endpoint_requires_clearance(self, client):
+        """GET /missions/{id}/classified enforces the header guard."""
+        mission = Mission.objects.create(name="Secret Mission", status="planned")
+
+        denied = client.get(f"/missions/{mission.id}/classified", headers={"X-Clearance-Level": "public"})
+        assert denied.status_code == 403
+
+        allowed = client.get(
+            f"/missions/{mission.id}/classified",
+            headers={"X-Clearance-Level": "top-secret"},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["mission"] == "Secret Mission"
+
+    def test_mission_log_returns_plain_text(self, client):
+        """GET /missions/{id}/log returns a text log."""
+        mission = Mission.objects.create(name="Apollo 11", status="active")
+
+        response = client.get(f"/missions/{mission.id}/log")
+        assert response.status_code == 200
+        assert "MISSION LOG: Apollo 11" in response.text
+        assert response.headers["content-type"].startswith("text/plain")
+
+    def test_upload_patch_persists_filename(self, client):
+        """POST /missions/{id}/patch stores the patch path and returns metadata."""
+        mission = Mission.objects.create(name="Patch Test", status="planned")
+
+        response = client.post(
+            f"/missions/{mission.id}/patch",
+            files={"patch": ("patch.txt", b"patch-bytes", "text/plain")},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["filename"] == "patch.txt"
+        assert payload["mission"] == "Patch Test"
+
+        mission.refresh_from_db()
+        assert mission.patch_image.endswith("patch.txt")
+
+    def test_status_page_and_dashboard_render_html(self, client):
+        """HTML routes should render successfully."""
+        Mission.objects.create(name="Dashboard Mission", status="active", description="Visible in template")
+
+        status_page = client.get("/status-page")
+        assert status_page.status_code == 200
+        assert "Mission Control" in status_page.text
+
+        dashboard = client.get("/dashboard")
+        assert dashboard.status_code == 200
+        assert "Dashboard Mission" in dashboard.text
+
+    def test_go_redirects_to_dashboard(self, client):
+        """GET /go redirects to /dashboard."""
+        response = client.get("/go", follow_redirects=False)
+        assert response.status_code == 307
+        assert response.headers["location"] == "/dashboard"

@@ -1,9 +1,12 @@
-"""Simple tests for nested serializer support."""
+"""Simple tests for type-driven nested serializer support."""
 
 from __future__ import annotations
 
 from typing import Annotated
 
+import pytest
+
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import Nested, Serializer
 
 
@@ -13,42 +16,60 @@ def test_nested_import():
 
 
 def test_nested_config_creation():
-    """Test creating a Nested config."""
-
-    class TestSerializer(Serializer):
-        id: int
-        name: str
-
-    config = Nested(TestSerializer)
+    """Test creating Nested metadata for optional overrides."""
+    config = Nested()
     assert config is not None
-    assert config.serializer_class == TestSerializer
-    assert config.many is False
+    assert config.max_items == 1000
 
 
-def test_nested_with_many():
-    """Test Nested config with many=True."""
+def test_nested_with_max_items():
+    """Test Nested metadata with custom max_items."""
+    config = Nested(max_items=10)
+    assert config.max_items == 10
+
+
+def test_nested_rejects_removed_positional_api():
+    """Test that redundant positional Nested arguments are rejected."""
 
     class TagSerializer(Serializer):
         id: int
         name: str
 
-    config = Nested(TagSerializer, many=True)
-    assert config.many is True
+    with pytest.raises(TypeError, match="type annotation"):
+        Nested(TagSerializer)  # type: ignore
+
+    with pytest.raises(TypeError, match="type annotation"):
+        Nested(many=True)  # type: ignore
 
 
-def test_nested_annotation():
-    """Test using Nested in a serializer annotation."""
+def test_nested_rejects_old_serializer_class_api_with_helpful_message():
+    """Test that the removed Nested(ChildSerializer) API gives migration guidance."""
 
     class AuthorSerializer(Serializer):
         id: int
         username: str
 
-    # Nested serializers now require full objects
+    with pytest.raises(TypeError) as exc_info:
+        Nested(AuthorSerializer)  # type: ignore[arg-type]
+
+    message = str(exc_info.value)
+    assert "no longer accepts serializer classes or many=" in message
+    assert "Nested fields are inferred from the type annotation." in message
+    assert "Use ChildSerializer or list[ChildSerializer]" in message
+    assert "Annotated[..., Nested(max_items=...)]" in message
+
+
+def test_nested_annotation():
+    """Test nested serializers inferred from plain serializer types."""
+
+    class AuthorSerializer(Serializer):
+        id: int
+        username: str
+
     class BookDetailSerializer(Serializer):
         title: str
-        author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+        author: AuthorSerializer
 
-    # Create with full author object
     author = AuthorSerializer(id=1, username="alice")
     book = BookDetailSerializer(title="Test Book", author=author)
 
@@ -66,9 +87,8 @@ def test_nested_with_dict():
 
     class BookSerializer(Serializer):
         title: str
-        author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+        author: AuthorSerializer
 
-    # Should accept dict and convert to serializer
     book = BookSerializer(title="Test", author={"id": 123, "username": "bob"})
 
     assert isinstance(book.author, AuthorSerializer)
@@ -77,9 +97,8 @@ def test_nested_with_dict():
 
 
 def test_simple_id_reference():
-    """Test using plain int for ID-only fields (no Nested)."""
+    """Test using plain int for ID-only fields."""
 
-    # For ID-only fields, just use int directly
     class BookListSerializer(Serializer):
         title: str
         author_id: int
@@ -98,7 +117,7 @@ def test_nested_with_serializer_instance():
 
     class BookSerializer(Serializer):
         title: str
-        author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+        author: AuthorSerializer
 
     author = AuthorSerializer(id=1, username="alice")
     book = BookSerializer(title="Test", author=author)
@@ -108,7 +127,7 @@ def test_nested_with_serializer_instance():
 
 
 def test_nested_many_with_objects():
-    """Test that nested many field accepts list of objects."""
+    """Test that list[Serializer] fields accept nested objects."""
 
     class TagSerializer(Serializer):
         id: int
@@ -116,9 +135,8 @@ def test_nested_many_with_objects():
 
     class BookSerializer(Serializer):
         title: str
-        tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+        tags: list[TagSerializer]
 
-    # Accept list of dicts
     book = BookSerializer(
         title="Test",
         tags=[
@@ -128,12 +146,12 @@ def test_nested_many_with_objects():
     )
 
     assert len(book.tags) == 2
-    assert all(isinstance(t, TagSerializer) for t in book.tags)
+    assert all(isinstance(tag, TagSerializer) for tag in book.tags)
     assert book.tags[0].name == "python"
 
 
 def test_nested_many_accepts_empty_list():
-    """Test that nested many field accepts empty list."""
+    """Test that nested list fields accept empty lists."""
 
     class TagSerializer(Serializer):
         id: int
@@ -141,17 +159,37 @@ def test_nested_many_accepts_empty_list():
 
     class BookSerializer(Serializer):
         title: str
-        tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+        tags: list[TagSerializer]
 
     book = BookSerializer(title="Test", tags=[])
 
     assert book.tags == []
 
 
-def test_list_of_ids_without_nested():
-    """Test using plain list[int] for ID-only fields (no Nested)."""
+def test_nested_many_custom_limit_metadata():
+    """Test that Annotated Nested metadata still provides max_items overrides."""
 
-    # For ID-only many-to-many fields, just use list[int] directly
+    class TagSerializer(Serializer):
+        id: int
+        name: str
+
+    class BookSerializer(Serializer):
+        title: str
+        tags: Annotated[list[TagSerializer], Nested(max_items=1)]
+
+    with pytest.raises(RequestValidationError, match="Maximum allowed: 1"):
+        BookSerializer(
+            title="Test",
+            tags=[
+                {"id": 1, "name": "python"},
+                {"id": 2, "name": "django"},
+            ],
+        )
+
+
+def test_list_of_ids_without_nested():
+    """Test using plain list[int] for ID-only fields."""
+
     class BookListSerializer(Serializer):
         title: str
         tag_ids: list[int]

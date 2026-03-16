@@ -578,9 +578,9 @@ tags = [TagSerializer(id=1, name="python"), TagSerializer(id=2, name="django")]
 post = PostSerializer(id=1, title="Hello World", tags=tags)
 ```
 
-### Using Nested marker for Django models
+### Nested serializer fields
 
-The `Nested` marker provides explicit control over nested serialization:
+Nested fields are inferred directly from the type annotation:
 
 ```python
 from typing import Annotated
@@ -594,15 +594,24 @@ class AuthorSerializer(Serializer):
 class BlogPostSerializer(Serializer):
     id: int
     title: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
+```
+
+You only need `Nested(...)` when you want extra nested-field metadata, such as a custom list limit:
+
+```python
+class BlogPostSerializer(Serializer):
+    id: int
+    title: str
+    tags: Annotated[list[TagSerializer], Nested(max_items=200)]
 ```
 
 ## Django model integration
 
 ### From model to serializer
 
-Use `from_model()` to create serializer instances from Django models:
+Use `from_model()` to create serializer instances from Django models when you already have the data you need loaded:
 
 ```python
 class ArticleSerializer(Serializer):
@@ -610,23 +619,57 @@ class ArticleSerializer(Serializer):
     title: str
     content: str
 
-# From Django model
-article = await Article.objects.aget(id=1)
+# From a Django model without extra relation loading
+article = Article.objects.get(id=1)
 serializer = ArticleSerializer.from_model(article)
 ```
 
-### With select_related
-
-When using `from_model()` with ForeignKey relationships, use `select_related`:
+Use `afrom_model()` in async handlers when a serializer may need to read unloaded relations:
 
 ```python
-# Without select_related - may cause N+1 queries
-post = await BlogPost.objects.aget(id=1)
-serializer = BlogPostSerializer.from_model(post)  # author might be just an ID
+article = await Article.objects.aget(id=1)
+serializer = await ArticleSerializer.afrom_model(article)
+```
 
-# With select_related - nested object included
-post = await BlogPost.objects.select_related("author").aget(id=1)
-serializer = BlogPostSerializer.from_model(post)  # author is full object
+Quick rule of thumb:
+
+- `from_model()` is sync and non-querying
+- `afrom_model()` is async-safe and may lazy-load missing relations
+- in async handlers, default to `await afrom_model(...)` unless you intentionally want strict non-querying behavior
+
+### Relation loading with from_model()
+
+`from_model()` is non-querying. It only serializes relations that are already loaded on the model instance.
+
+Use `select_related()` for single relations and `prefetch_related()` for reverse or many relations:
+
+```python
+# Sync from_model() expects loaded relations
+post = await BlogPost.objects.select_related("author").prefetch_related("tags").aget(id=1)
+serializer = BlogPostSerializer.from_model(post)
+```
+
+If a nested relation is unloaded:
+
+- fields with defaults like `[]` or `None` keep their default value
+- required nested fields raise `SerializationError` with a preload hint
+
+For async handlers where relations may need to be loaded lazily, use `afrom_model()`:
+
+```python
+post = await BlogPost.objects.aget(id=1)
+serializer = await BlogPostSerializer.afrom_model(post)
+```
+
+This also applies to reverse relations:
+
+```python
+class UserSerializer(Serializer):
+    id: int
+    addresses: list[AddressSerializer] = []
+
+user = await User.objects.prefetch_related("addresses").aget(id=1)
+serializer = UserSerializer.from_model(user)
 ```
 
 ### Bulk serialization
@@ -720,13 +763,13 @@ UserDetailSerializer = UserSerializer.fields("detail")
 async def list_users() -> list[UserListSerializer]:
     users = []
     async for user in User.objects.all()[:20]:
-        users.append(UserListSerializer.from_model(user))
+        users.append(await UserListSerializer.afrom_model(user))
     return users
 
 @api.get("/users/{user_id}")
 async def get_user(user_id: int) -> UserDetailSerializer:
     user = await User.objects.aget(id=user_id)
-    return UserDetailSerializer.from_model(user)
+    return await UserDetailSerializer.afrom_model(user)
 ```
 
 ## Serializer vs raw msgspec.Struct
