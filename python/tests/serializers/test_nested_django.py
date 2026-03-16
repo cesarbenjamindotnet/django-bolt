@@ -17,8 +17,8 @@ import msgspec
 import pytest
 from msgspec import Meta
 
-from django_bolt.exceptions import RequestValidationError
-from django_bolt.serializers import Nested, Serializer, field_validator
+from django_bolt.exceptions import RequestValidationError, SerializationError
+from django_bolt.serializers import Serializer, field_validator
 from tests.test_models import Author, BlogPost, Comment, Tag
 
 
@@ -57,7 +57,7 @@ class CommentSerializer(Serializer):
     id: int
     text: str
     # Author as full object
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
 
 
 class BlogPostSerializer(Serializer):
@@ -67,9 +67,9 @@ class BlogPostSerializer(Serializer):
     title: str
     content: str
     # Author relationship - full object required
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
     # Tags relationship - full objects required
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    tags: list[TagSerializer]
     published: bool = False
 
 
@@ -79,10 +79,10 @@ class BlogPostDetailedSerializer(Serializer):
     id: int
     title: str
     content: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
     # Comments nested with their own nested authors
-    comments: Annotated[list[CommentSerializer], Nested(CommentSerializer, many=True)]
+    comments: list[CommentSerializer]
     published: bool = False
 
 
@@ -91,18 +91,19 @@ class TestSingleNestedForeignKey:
 
     @pytest.mark.django_db
     def test_from_model_without_select_related(self):
-        """Test that unselected FK returns ID only."""
+        """Test that unloaded nested FK raises a clear serialization error."""
         author = Author.objects.create(name="Alice Smith", email="alice@example.com", bio="Author bio")
         post = BlogPost.objects.create(title="Test Post", content="Content", author=author)
 
         # Fetch without select_related
         post = BlogPost.objects.get(id=post.id)
 
-        # Convert to serializer
-        serializer = BlogPostSerializer.from_model(post)
+        with pytest.raises(SerializationError) as exc_info:
+            BlogPostSerializer.from_model(post)
 
-        # Author should be the ID (not an AuthorSerializer)
-        assert serializer.author == author.id or isinstance(serializer.author, AuthorSerializer)
+        error_message = str(exc_info.value)
+        assert "author" in error_message
+        assert "select_related('author')" in error_message
 
     @pytest.mark.django_db
     def test_from_model_with_select_related(self):
@@ -110,19 +111,15 @@ class TestSingleNestedForeignKey:
         author = Author.objects.create(name="Bob Jones", email="bob@example.com", bio="Bio")
         post = BlogPost.objects.create(title="Test Post", content="Content", author=author)
 
-        # Fetch WITH select_related
-        post = BlogPost.objects.select_related("author").get(id=post.id)
+        # Fetch with all required relations loaded for BlogPostSerializer
+        post = BlogPost.objects.select_related("author").prefetch_related("tags").get(id=post.id)
 
         # Convert to serializer
         serializer = BlogPostSerializer.from_model(post)
 
-        # Check if author was included
-        if isinstance(serializer.author, AuthorSerializer):
-            assert serializer.author.name == "Bob Jones"
-            assert serializer.author.email == "bob@example.com"
-        else:
-            # If it's an ID, that's also valid
-            assert serializer.author == author.id
+        assert isinstance(serializer.author, AuthorSerializer)
+        assert serializer.author.name == "Bob Jones"
+        assert serializer.author.email == "bob@example.com"
 
     @pytest.mark.django_db
     def test_create_with_nested_author_dict(self):
@@ -185,7 +182,7 @@ class TestNestedManyToMany:
 
     @pytest.mark.django_db
     def test_from_model_without_prefetch_related(self):
-        """Test that unprefetched M2M returns IDs only."""
+        """Test that unloaded nested M2M raises a clear serialization error."""
         author = Author.objects.create(name="Eve", email="eve@example.com")
         tag1 = Tag.objects.create(name="python", description="Python tag")
         tag2 = Tag.objects.create(name="django", description="Django tag")
@@ -196,11 +193,12 @@ class TestNestedManyToMany:
         # Fetch without prefetch_related
         post = BlogPost.objects.select_related("author").get(id=post.id)
 
-        serializer = BlogPostSerializer.from_model(post)
+        with pytest.raises(SerializationError) as exc_info:
+            BlogPostSerializer.from_model(post)
 
-        # Tags should be a list (either IDs or TagSerializers)
-        assert isinstance(serializer.tags, list)
-        assert len(serializer.tags) == 2
+        error_message = str(exc_info.value)
+        assert "tags" in error_message
+        assert "prefetch_related('tags')" in error_message
 
     @pytest.mark.django_db
     def test_from_model_with_prefetch_related(self):
@@ -221,9 +219,8 @@ class TestNestedManyToMany:
         assert isinstance(serializer.tags, list)
         assert len(serializer.tags) == 2
 
-        # All tags should be either TagSerializer or int
         for tag in serializer.tags:
-            assert isinstance(tag, (TagSerializer, int))
+            assert isinstance(tag, TagSerializer)
 
     @pytest.mark.django_db
     def test_create_with_tag_dicts(self):
@@ -344,7 +341,7 @@ class TestQueryOptimization:
 
     @pytest.mark.django_db
     def test_list_without_prefetch(self):
-        """Test listing posts without any prefetch (IDs only)."""
+        """Test listing posts without required preloads raises serialization error."""
         author = Author.objects.create(name="Iris", email="iris@example.com")
         tag = Tag.objects.create(name="test")
 
@@ -356,18 +353,12 @@ class TestQueryOptimization:
 
         # Fetch only the posts we created
         all_posts = BlogPost.objects.filter(id__in=post_ids)
-        serializers = [BlogPostSerializer.from_model(p) for p in all_posts]
-
-        assert len(serializers) == 3
-        for serializer in serializers:
-            # Author should be ID (FK not selected)
-            assert isinstance(serializer.author, (int, AuthorSerializer))
-            # Tags should be IDs (M2M not prefetched)
-            assert isinstance(serializer.tags, list)
+        with pytest.raises(SerializationError):
+            [BlogPostSerializer.from_model(p) for p in all_posts]
 
     @pytest.mark.django_db
     def test_list_with_select_related(self):
-        """Test listing posts with select_related."""
+        """Test that select_related alone is insufficient for required nested many relations."""
         author = Author.objects.create(name="Jack", email="jack@example.com")
 
         post_ids = []
@@ -377,13 +368,8 @@ class TestQueryOptimization:
 
         # Fetch only the posts we created with select_related
         all_posts = BlogPost.objects.filter(id__in=post_ids).select_related("author")
-        serializers = [BlogPostSerializer.from_model(p) for p in all_posts]
-
-        assert len(serializers) == 2
-        # Author should be nested object (select_related worked)
-        for serializer in serializers:
-            if isinstance(serializer.author, AuthorSerializer):
-                assert serializer.author.name == "Jack"
+        with pytest.raises(SerializationError):
+            [BlogPostSerializer.from_model(p) for p in all_posts]
 
     @pytest.mark.django_db
     def test_list_with_prefetch_related(self):
@@ -404,11 +390,10 @@ class TestQueryOptimization:
 
         assert len(serializers) == 2
         for serializer in serializers:
-            # Both author and tags should be optimized
-            if isinstance(serializer.author, AuthorSerializer):
-                assert serializer.author.name == "Kate"
-            # Tags list should exist
+            assert isinstance(serializer.author, AuthorSerializer)
+            assert serializer.author.name == "Kate"
             assert len(serializer.tags) == 2
+            assert all(isinstance(tag, TagSerializer) for tag in serializer.tags)
 
     @pytest.mark.django_db
     def test_list_with_full_prefetch(self):
@@ -431,9 +416,8 @@ class TestQueryOptimization:
         assert len(serializers) == 1
         serializer = serializers[0]
 
-        # All relationships should be optimized
-        if isinstance(serializer.author, AuthorSerializer):
-            assert serializer.author.name == "Liam"
+        assert isinstance(serializer.author, AuthorSerializer)
+        assert serializer.author.name == "Liam"
         assert len(serializer.tags) == 1
         assert len(serializer.comments) == 1
 
@@ -625,11 +609,11 @@ class TestNestedFieldValidation:
         post = BlogPost.objects.create(title="Post", content="Content", author=author)
 
         # Fetch and convert
-        post = BlogPost.objects.select_related("author").get(id=post.id)
+        post = BlogPost.objects.select_related("author").prefetch_related("tags").get(id=post.id)
         serializer = BlogPostSerializer.from_model(post)
 
-        # Author should be extracted as ID or object
-        assert serializer.author == author.id or isinstance(serializer.author, AuthorSerializer)
+        assert isinstance(serializer.author, AuthorSerializer)
+        assert serializer.author.name == "Karen"
 
     def test_valid_author_in_nested_comment(self):
         """Test validation of valid author in nested comment."""
@@ -664,19 +648,15 @@ class TestEdgeCases:
 
         serializer = BlogPostDetailedSerializer.from_model(post)
 
-        # Empty lists should be valid
-        assert serializer.tags == [] or all(isinstance(t, (TagSerializer, int)) for t in serializer.tags)
-        assert serializer.comments == [] or all(isinstance(c, (CommentSerializer, int)) for c in serializer.comments)
+        assert serializer.tags == []
+        assert serializer.comments == []
 
     def test_optional_nested_field(self):
         """Test optional nested field with None."""
 
         class OptionalAuthorSerializer(Serializer):
             title: str
-            author: Annotated[
-                AuthorSerializer | None,
-                Nested(AuthorSerializer),
-            ] = None
+            author: AuthorSerializer | None = None
 
         # Should accept None
         serializer = OptionalAuthorSerializer(title="Post", author=None)

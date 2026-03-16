@@ -578,9 +578,9 @@ tags = [TagSerializer(id=1, name="python"), TagSerializer(id=2, name="django")]
 post = PostSerializer(id=1, title="Hello World", tags=tags)
 ```
 
-### Using Nested marker for Django models
+### Nested serializer fields
 
-The `Nested` marker provides explicit control over nested serialization:
+Nested fields are inferred directly from the type annotation:
 
 ```python
 from typing import Annotated
@@ -594,8 +594,17 @@ class AuthorSerializer(Serializer):
 class BlogPostSerializer(Serializer):
     id: int
     title: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
+```
+
+You only need `Nested(...)` when you want extra nested-field metadata, such as a custom list limit:
+
+```python
+class BlogPostSerializer(Serializer):
+    id: int
+    title: str
+    tags: Annotated[list[TagSerializer], Nested(max_items=200)]
 ```
 
 ## Django model integration
@@ -615,18 +624,39 @@ article = await Article.objects.aget(id=1)
 serializer = ArticleSerializer.from_model(article)
 ```
 
-### With select_related
+### Relation loading with from_model()
 
-When using `from_model()` with ForeignKey relationships, use `select_related`:
+`from_model()` is non-querying. It only serializes relations that are already loaded on the model instance.
+
+Use `select_related()` for single relations and `prefetch_related()` for reverse or many relations:
 
 ```python
-# Without select_related - may cause N+1 queries
-post = await BlogPost.objects.aget(id=1)
-serializer = BlogPostSerializer.from_model(post)  # author might be just an ID
+# Sync from_model() expects loaded relations
+post = await BlogPost.objects.select_related("author").prefetch_related("tags").aget(id=1)
+serializer = BlogPostSerializer.from_model(post)
+```
 
-# With select_related - nested object included
-post = await BlogPost.objects.select_related("author").aget(id=1)
-serializer = BlogPostSerializer.from_model(post)  # author is full object
+If a nested relation is unloaded:
+
+- fields with defaults like `[]` or `None` keep their default value
+- required nested fields raise `SerializationError` with a preload hint
+
+For async handlers where relations may need to be loaded lazily, use `afrom_model()`:
+
+```python
+post = await BlogPost.objects.aget(id=1)
+serializer = await BlogPostSerializer.afrom_model(post)
+```
+
+This also applies to reverse relations:
+
+```python
+class UserSerializer(Serializer):
+    id: int
+    addresses: list[AddressSerializer] = []
+
+user = await User.objects.prefetch_related("addresses").aget(id=1)
+serializer = UserSerializer.from_model(user)
 ```
 
 ### Bulk serialization

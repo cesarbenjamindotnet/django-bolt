@@ -186,7 +186,12 @@ def field(
     return _FieldMarker(config=config)
 
 
-def get_msgspec_type_for_django_field(field: models.Field) -> type:
+def _build_literal_type(choice_values: list[Any]) -> Any:
+    """Build a runtime Literal annotation from dynamic Django choices."""
+    return Literal.__getitem__(tuple(choice_values))
+
+
+def get_msgspec_type_for_django_field(field: models.Field) -> Any:
     """
     Convert a Django model field to a msgspec-compatible type annotation.
 
@@ -209,8 +214,7 @@ def get_msgspec_type_for_django_field(field: models.Field) -> type:
         if field.choices:
             # Extract choice values (first element of each tuple)
             choice_values = [choice[0] for choice in field.choices]
-            # Create Literal type with all valid choices
-            base_type = Literal[tuple(choice_values)]
+            base_type = _build_literal_type(choice_values)
         else:
             constraints["max_length"] = field.max_length
             base_type = str
@@ -228,8 +232,7 @@ def get_msgspec_type_for_django_field(field: models.Field) -> type:
         if field.choices:
             # Extract choice values (first element of each tuple)
             choice_values = [choice[0] for choice in field.choices]
-            # Create Literal type with all valid choices
-            base_type = Literal[tuple(choice_values)]
+            base_type = _build_literal_type(choice_values)
         else:
             base_type = int
             # Handle validators for ranges
@@ -302,7 +305,7 @@ def create_msgspec_field_definition(
     field: models.Field,
     write_only: bool = False,
     read_only: bool = False,
-) -> tuple[str, type, dict[str, Any]]:
+) -> tuple[str, Any, dict[str, Any]]:
     """
     Create a msgspec field definition from a Django field.
 
@@ -314,6 +317,10 @@ def create_msgspec_field_definition(
     Returns:
         Tuple of (field_name, field_type, field_metadata)
     """
+    field_name = field.name
+    if not field_name:
+        raise ValueError("Django field must have a name to create a serializer definition")
+
     field_type = get_msgspec_type_for_django_field(field)
 
     # Build metadata dict
@@ -324,4 +331,4 @@ def create_msgspec_field_definition(
         "verbose_name": field.verbose_name,
     }
 
-    return field.name, field_type, metadata
+    return field_name, field_type, metadata

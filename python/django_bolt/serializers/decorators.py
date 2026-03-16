@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, get_type_hints, overload
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,33 @@ if TYPE_CHECKING:
     from .base import Serializer
 
 T = TypeVar("T")
+ValidatorMode = Literal["before", "after"]
+
+
+class _ComputedFieldCallable(Protocol):
+    __name__: str
+    __computed_field__: ComputedFieldConfig
+
+    def __call__(self, instance: Any, /) -> Any: ...
+
+
+class _FieldValidatorCallable(Protocol):
+    __validator_field__: str
+    __validator_mode__: ValidatorMode
+
+    def __call__(self, serializer_cls: type[Serializer], value: Any, /) -> Any: ...
+
+
+class _ModelValidatorCallable(Protocol):
+    __model_validator__: bool
+    __validator_mode__: ValidatorMode
+
+    def __call__(self, serializer: Serializer, /) -> Serializer: ...
+
+
+ComputedFieldMethod = Callable[[Any], Any]
+FieldValidatorFunc = Callable[[type["Serializer"], Any], Any]
+ModelValidatorFunc = Callable[["Serializer"], "Serializer"]
 
 # Marker attributes for storing validators on classes
 FIELD_VALIDATORS_ATTR = "__field_validators__"
@@ -44,7 +71,7 @@ class ComputedFieldConfig:
 
 
 def computed_field(
-    func: Callable[[Any], Any] | None = None,
+    func: ComputedFieldMethod | None = None,
     *,
     alias: str | None = None,
     description: str | None = None,
@@ -91,7 +118,7 @@ def computed_field(
         - Method name becomes the field name (unless alias is specified)
     """
 
-    def decorator(method: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    def decorator(method: ComputedFieldMethod) -> ComputedFieldMethod:
         # Try to get return type from method annotations
         return_type = Any
         try:
@@ -105,8 +132,9 @@ def computed_field(
             )
 
         # Store computed field metadata on the method
-        method.__computed_field__ = ComputedFieldConfig(
-            method_name=method.__name__,
+        typed_method = cast(_ComputedFieldCallable, method)
+        typed_method.__computed_field__ = ComputedFieldConfig(
+            method_name=typed_method.__name__,
             return_type=return_type,
             description=description,
             alias=alias,
@@ -125,8 +153,8 @@ def computed_field(
 
 def field_validator(
     field_name: str,
-    mode: Literal["before", "after"] = "after",
-) -> Callable[[Callable[[type[Serializer], Any], Any]], Callable[[type[Serializer], Any], Any]]:
+    mode: ValidatorMode = "after",
+) -> Callable[[FieldValidatorFunc], FieldValidatorFunc]:
     """
     Decorator to validate a specific field in a Serializer.
 
@@ -146,20 +174,32 @@ def field_validator(
     """
 
     def decorator(
-        func: Callable[[type[Serializer], Any], Any],
-    ) -> Callable[[type[Serializer], Any], Any]:
+        func: FieldValidatorFunc,
+    ) -> FieldValidatorFunc:
         # Store validator metadata on the function
-        func.__validator_field__ = field_name
-        func.__validator_mode__ = mode
+        typed_func = cast(_FieldValidatorCallable, func)
+        typed_func.__validator_field__ = field_name
+        typed_func.__validator_mode__ = mode
         return func
 
     return decorator
 
 
+@overload
+def model_validator(func: ModelValidatorFunc, mode: ValidatorMode = "after") -> ModelValidatorFunc: ...
+
+
+@overload
 def model_validator(
-    func: Callable[[Serializer], Serializer] | None = None,
-    mode: Literal["before", "after"] = "after",
-) -> Callable[[Callable[[Serializer], Serializer]], Callable[[Serializer], Serializer]]:
+    func: None = None,
+    mode: ValidatorMode = "after",
+) -> Callable[[ModelValidatorFunc], ModelValidatorFunc]: ...
+
+
+def model_validator(
+    func: ModelValidatorFunc | None = None,
+    mode: ValidatorMode = "after",
+) -> ModelValidatorFunc | Callable[[ModelValidatorFunc], ModelValidatorFunc]:
     """
     Decorator to validate an entire Serializer after all fields are set.
 
@@ -179,11 +219,12 @@ def model_validator(
     """
 
     def decorator(
-        validator_func: Callable[[Serializer], Serializer],
-    ) -> Callable[[Serializer], Serializer]:
+        validator_func: ModelValidatorFunc,
+    ) -> ModelValidatorFunc:
         # Store validator metadata on the function
-        validator_func.__model_validator__ = True
-        validator_func.__validator_mode__ = mode
+        typed_validator = cast(_ModelValidatorCallable, validator_func)
+        typed_validator.__model_validator__ = True
+        typed_validator.__validator_mode__ = mode
         return validator_func
 
     if func is None:
@@ -191,18 +232,19 @@ def model_validator(
         return decorator
     else:
         # Called without parentheses: @model_validator
-        func.__model_validator__ = True
-        func.__validator_mode__ = mode
+        typed_func = cast(_ModelValidatorCallable, func)
+        typed_func.__model_validator__ = True
+        typed_func.__validator_mode__ = mode
         return func
 
 
-def collect_field_validators(cls: type[Serializer]) -> dict[str, list[Callable[[Any], Any]]]:
+def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValidatorFunc]]:
     """
     Collect all field validators from a class and its bases.
 
     Returns a dict mapping field names to lists of validator functions.
     """
-    validators: dict[str, list[Callable[[Any], Any]]] = {}
+    validators: dict[str, list[FieldValidatorFunc]] = {}
 
     # Walk through MRO to collect validators
     for base in cls.__mro__:
@@ -211,21 +253,22 @@ def collect_field_validators(cls: type[Serializer]) -> dict[str, list[Callable[[
 
         for _name, value in base.__dict__.items():
             if callable(value) and hasattr(value, "__validator_field__"):
-                field_name = value.__validator_field__
+                validator = cast(_FieldValidatorCallable, value)
+                field_name = validator.__validator_field__
                 if field_name not in validators:
                     validators[field_name] = []
-                validators[field_name].append(value)
+                validators[field_name].append(cast(FieldValidatorFunc, value))
 
     return validators
 
 
-def collect_model_validators(cls: type[Serializer]) -> list[Callable[[Serializer], Serializer]]:
+def collect_model_validators(cls: type[Serializer]) -> list[ModelValidatorFunc]:
     """
     Collect all model validators from a class and its bases.
 
     Returns a list of validator functions in MRO order.
     """
-    validators: list[Callable[[Serializer], Serializer]] = []
+    validators: list[ModelValidatorFunc] = []
 
     # Walk through MRO to collect validators
     for base in cls.__mro__:
@@ -234,7 +277,7 @@ def collect_model_validators(cls: type[Serializer]) -> list[Callable[[Serializer
 
         for _name, value in base.__dict__.items():
             if callable(value) and hasattr(value, "__model_validator__"):
-                validators.append(value)
+                validators.append(cast(ModelValidatorFunc, value))
 
     return validators
 
@@ -254,7 +297,7 @@ def collect_computed_fields(cls: type[Serializer]) -> dict[str, ComputedFieldCon
 
         for _name, value in base.__dict__.items():
             if callable(value) and hasattr(value, "__computed_field__"):
-                config: ComputedFieldConfig = value.__computed_field__
+                config = cast(_ComputedFieldCallable, value).__computed_field__
                 # Use alias if provided, otherwise use method name
                 field_name = config.alias or config.method_name
                 computed[field_name] = config

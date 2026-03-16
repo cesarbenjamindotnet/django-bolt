@@ -15,7 +15,7 @@ from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 from django_bolt.views import ViewSet
 
-from .test_models import Article
+from .test_models import Article, Author, BlogPost
 
 # ============================================================================
 # Serializers for Testing
@@ -48,6 +48,21 @@ class ArticleMsgspecSchema(msgspec.Struct):
     author: str
 
 
+class AuthorNestedSerializer(Serializer):
+    """Nested author serializer for pagination relation tests."""
+
+    id: int
+    name: str
+
+
+class BlogPostListSerializer(Serializer):
+    """Blog post serializer with nested author."""
+
+    id: int
+    title: str
+    author: AuthorNestedSerializer
+
+
 # ============================================================================
 # Test Fixtures
 # ============================================================================
@@ -66,6 +81,22 @@ def sample_articles(db):
         )
         articles.append(article)
     return articles
+
+
+@pytest.fixture
+def sample_blog_posts(db):
+    """Create blog posts with authors for nested pagination tests."""
+    posts = []
+    for i in range(1, 6):
+        author = Author.objects.create(name=f"Author {i}", email=f"author{i}@example.com")
+        post = BlogPost.objects.create(
+            title=f"Post {i}",
+            content=f"Post content {i}",
+            author=author,
+            published=i % 2 == 0,
+        )
+        posts.append(post)
+    return posts
 
 
 # ============================================================================
@@ -197,6 +228,29 @@ def test_paginate_with_return_type_annotation(sample_articles):
         assert "author" in first_item
         assert "content" not in first_item
         assert "is_published" not in first_item
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginate_with_nested_serializer_uses_afrom_model(sample_blog_posts):
+    """Test async pagination uses afrom_model for nested relations."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 5
+
+    @api.get("/posts", response_model=list[BlogPostListSerializer])
+    @paginate(SmallPagePagination)
+    async def list_posts(request):
+        return BlogPost.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/posts?page=1")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert len(data["items"]) == 5
+        first_item = data["items"][0]
+        assert first_item["author"]["name"].startswith("Author ")
 
 
 # ============================================================================

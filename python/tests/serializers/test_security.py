@@ -3,7 +3,7 @@ Security tests for Django-Bolt serializers.
 
 Tests cover:
 - DoS prevention: Input size limits for nested lists
-- Type safety: Nested() validation
+- Type safety: Nested() metadata API
 - Circular reference detection in from_model()
 - Performance optimizations
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from typing import Annotated
 
-import msgspec
 import pytest
 
 from django_bolt.exceptions import RequestValidationError
@@ -31,7 +30,7 @@ class TestNestedListSizeLimits:
 
         class BookSerializer(Serializer):
             title: str
-            tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+            tags: list[TagSerializer]
 
         # Create 1001 tags (exceeds default limit of 1000)
         many_tags = [{"id": i, "name": f"tag_{i}"} for i in range(1001)]
@@ -53,7 +52,7 @@ class TestNestedListSizeLimits:
 
         class BookSerializer(Serializer):
             title: str
-            tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+            tags: list[TagSerializer]
 
         # Create 999 tags (under default limit)
         tags = [{"id": i, "name": f"tag_{i}"} for i in range(999)]
@@ -70,7 +69,7 @@ class TestNestedListSizeLimits:
 
         class BookSerializer(Serializer):
             title: str
-            tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True, max_items=10)]
+            tags: Annotated[list[TagSerializer], Nested(max_items=10)]
 
         # 11 items exceeds custom limit of 10
         many_tags = [{"id": i, "name": f"tag_{i}"} for i in range(11)]
@@ -93,7 +92,7 @@ class TestNestedListSizeLimits:
         class BookSerializer(Serializer):
             title: str
             # Note: Setting max_items to None disables limit - NOT recommended for production
-            tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True, max_items=None)]
+            tags: Annotated[list[TagSerializer], Nested(max_items=None)]
 
         # Create 2000 tags (would exceed default limit, but we disabled it)
         many_tags = [{"id": i, "name": f"tag_{i}"} for i in range(2000)]
@@ -103,7 +102,7 @@ class TestNestedListSizeLimits:
         assert len(book.tags) == 2000
 
     def test_nested_single_not_affected_by_limit(self):
-        """Test that single nested fields (many=False) are not affected by size limits."""
+        """Test that single nested fields are not affected by size limits."""
 
         class AuthorSerializer(Serializer):
             id: int
@@ -111,7 +110,7 @@ class TestNestedListSizeLimits:
 
         class BookSerializer(Serializer):
             title: str
-            author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+            author: AuthorSerializer
 
         # Single nested object should work fine
         book = BookSerializer(title="Test", author={"id": 1, "name": "Alice"})
@@ -119,67 +118,33 @@ class TestNestedListSizeLimits:
 
 
 class TestNestedTypeSafety:
-    """Test that Nested() validates serializer_class at definition time."""
+    """Test that Nested() only accepts keyword metadata overrides."""
 
-    def test_nested_rejects_non_class(self):
-        """Test that Nested() rejects non-class values."""
+    def test_nested_rejects_positional_arguments(self):
+        """Test that Nested() rejects the removed positional API."""
 
         class AuthorSerializer(Serializer):
             id: int
             name: str
 
-        # Try to pass an instance instead of a class
         author_instance = AuthorSerializer(id=1, name="Alice")
 
         with pytest.raises(TypeError) as exc_info:
             Nested(author_instance)  # type: ignore
 
         error_msg = str(exc_info.value)
-        assert "must be a class" in error_msg
-        assert "Nested(MySerializer) not Nested(MySerializer())" in error_msg
+        assert "no longer accepts serializer classes" in error_msg
+        assert "type annotation" in error_msg
 
-    def test_nested_rejects_non_serializer_class(self):
-        """Test that Nested() rejects classes that don't inherit from Serializer."""
+    def test_nested_rejects_many_keyword(self):
+        """Test that many= is no longer accepted."""
+        with pytest.raises(TypeError, match="no longer accepts serializer classes or many="):
+            Nested(many=True)  # type: ignore
 
-        class NotASerializer:
-            """This is not a Serializer subclass."""
-
-            id: int
-            name: str
-
-        with pytest.raises(TypeError) as exc_info:
-            Nested(NotASerializer)  # type: ignore
-
-        error_msg = str(exc_info.value)
-        assert "must be a Serializer subclass" in error_msg
-        assert "NotASerializer" in error_msg
-
-    def test_nested_accepts_valid_serializer_class(self):
-        """Test that Nested() accepts valid Serializer subclasses."""
-
-        class AuthorSerializer(Serializer):
-            id: int
-            name: str
-
-        # This should work fine
-        config = Nested(AuthorSerializer)
-        assert config.serializer_class == AuthorSerializer
-        assert config.many is False
-
-    def test_nested_with_msgspec_struct_not_serializer(self):
-        """Test that Nested() rejects msgspec.Struct classes that don't inherit from Serializer."""
-
-        class PlainStruct(msgspec.Struct):
-            """This is a msgspec.Struct but not a Serializer."""
-
-            id: int
-            name: str
-
-        with pytest.raises(TypeError) as exc_info:
-            Nested(PlainStruct)  # type: ignore
-
-        error_msg = str(exc_info.value)
-        assert "must be a Serializer subclass" in error_msg
+    def test_nested_accepts_keyword_metadata_only(self):
+        """Test that Nested() accepts keyword-only max_items metadata."""
+        config = Nested(max_items=25)
+        assert config.max_items == 25
 
 
 class TestRecursionPrevention:
@@ -200,7 +165,7 @@ class TestRecursionPrevention:
         class BookSerializer(Serializer):
             title: str
             # Default max_items=1000
-            tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+            tags: list[TagSerializer]
 
         # Attempt to create 10,000 tags (would consume significant memory)
         many_tags = [{"id": i, "name": f"tag_{i}"} for i in range(10000)]
@@ -251,16 +216,8 @@ class TestNestedConfigRepr:
 
     def test_nested_config_repr_includes_max_items(self):
         """Test that NestedConfig __repr__ includes max_items."""
-
-        class TagSerializer(Serializer):
-            id: int
-            name: str
-
-        config = Nested(TagSerializer, many=True, max_items=500)
+        config = Nested(max_items=500)
         repr_str = repr(config)
-
-        assert "TagSerializer" in repr_str
-        assert "many=True" in repr_str
         assert "max_items=500" in repr_str
 
 

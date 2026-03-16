@@ -27,7 +27,6 @@ from django_bolt.api import BoltAPI
 from django_bolt.exceptions import BadRequest
 from django_bolt.serializers import (
     Email,
-    Nested,
     NonEmptyStr,
     Serializer,
     computed_field,
@@ -77,7 +76,7 @@ class CommentSerializer(Serializer):
     id: int
     text: str
     # Author as full object
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
 
 
 class BlogPostSerializer(Serializer):
@@ -87,9 +86,9 @@ class BlogPostSerializer(Serializer):
     title: str
     content: str
     # Author relationship - full object required
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
     # Tags relationship - full objects required
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    tags: list[TagSerializer]
     published: bool = False
 
 
@@ -99,8 +98,8 @@ class BlogPostInputSerializer(Serializer):
     title: str
     content: str
     # For input, we accept full nested objects (msgspec can decode these)
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
     published: bool = False
 
 
@@ -110,10 +109,10 @@ class BlogPostDetailedSerializer(Serializer):
     id: int
     title: str
     content: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
     # Comments nested with their own nested authors
-    comments: Annotated[list[CommentSerializer], Nested(CommentSerializer, many=True)]
+    comments: list[CommentSerializer]
     published: bool = False
 
 
@@ -122,10 +121,10 @@ class BlogPostDetailedInputSerializer(Serializer):
 
     title: str
     content: str
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    author: AuthorSerializer
+    tags: list[TagSerializer]
     # Comments nested with their own nested authors
-    comments: Annotated[list[CommentSerializer], Nested(CommentSerializer, many=True)]
+    comments: list[CommentSerializer]
     published: bool = False
 
 
@@ -211,6 +210,7 @@ def create_post_with_tags(data: BlogPostInputSerializer):
     if tag_ids:
         post.tags.set(tag_ids)
 
+    post = BlogPost.objects.select_related("author").prefetch_related("tags").get(id=post.id)
     return BlogPostSerializer.from_model(post)
 
 
@@ -269,6 +269,7 @@ def create_post_full(data: BlogPostDetailedInputSerializer):
             text=comment_data.text,
         )
 
+    post = BlogPost.objects.select_related("author").prefetch_related("tags", "comments__author").get(id=post.id)
     return BlogPostDetailedSerializer.from_model(post)
 
 
@@ -284,9 +285,9 @@ class BlogPostCreateSerializer(Serializer):
     title: Annotated[str, Meta(min_length=3)]
     content: Annotated[str, Meta(min_length=10)]
     # Author must be a full object, not just ID
-    author: Annotated[AuthorSerializer, Nested(AuthorSerializer)]
+    author: AuthorSerializer
     # Tags must be full objects for input
-    tags: Annotated[list[TagSerializer], Nested(TagSerializer, many=True)]
+    tags: list[TagSerializer]
     published: bool = False
 
     @field_validator("title")
@@ -330,6 +331,7 @@ def create_post_strict(data: BlogPostCreateSerializer):
     if tag_ids:
         post.tags.set(tag_ids)
 
+    post = BlogPost.objects.select_related("author").prefetch_related("tags").get(id=post.id)
     return BlogPostSerializer.from_model(post)
 
 
@@ -803,7 +805,7 @@ class UserProfileSerializer(Serializer):
     """Serializer for user profile with nested user data - OUTPUT."""
 
     id: int
-    user: Annotated[UserSerializer, Nested(UserSerializer)]
+    user: UserSerializer
     bio: Annotated[str, Meta(max_length=500)] = ""
     avatar_url: str = ""
     phone: Annotated[str, Meta(max_length=20)] = ""
@@ -1062,7 +1064,7 @@ class AdvancedCommentSerializer(Serializer):
 
     id: int
     text: str
-    author: Annotated[AdvancedAuthorSerializer, Nested(AdvancedAuthorSerializer)]
+    author: AdvancedAuthorSerializer
     created_at: datetime | None = None
 
     @computed_field
@@ -1080,9 +1082,9 @@ class AdvancedBlogPostSerializer(Serializer):
     id: int
     title: NonEmptyStr
     content: str
-    author: Annotated[AdvancedAuthorSerializer, Nested(AdvancedAuthorSerializer)]
-    tags: Annotated[list[AdvancedTagSerializer], Nested(AdvancedTagSerializer, many=True)]
-    comments: Annotated[list[AdvancedCommentSerializer], Nested(AdvancedCommentSerializer, many=True)] = []
+    author: AdvancedAuthorSerializer
+    tags: list[AdvancedTagSerializer]
+    comments: list[AdvancedCommentSerializer] = []
     published: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -1144,8 +1146,8 @@ class AdvancedBlogPostInputSerializer(Serializer):
 
     title: Annotated[str, Meta(min_length=3, max_length=300)]
     content: Annotated[str, Meta(min_length=10)]
-    author: Annotated[AdvancedAuthorSerializer, Nested(AdvancedAuthorSerializer)]
-    tags: Annotated[list[AdvancedTagSerializer], Nested(AdvancedTagSerializer, many=True)] = []
+    author: AdvancedAuthorSerializer
+    tags: list[AdvancedTagSerializer] = []
     published: bool = False
 
     @field_validator("title")

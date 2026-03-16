@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Annotated, Literal
 
 from msgspec import Meta
 
-from django_bolt import BoltAPI
-from django_bolt.exceptions import NotFound
+from django_bolt import BoltAPI, Request
+from django_bolt.exceptions import HTTPException, NotFound
 from django_bolt.param_functions import Cookie, File, Form, Header, Query
-from django_bolt.serializers import Serializer, field_validator
+from django_bolt.responses import HTML, PlainText, Redirect
+from django_bolt.serializers import Serializer, field, field_validator
+from django_bolt.shortcuts import render
 from missions.models import Astronaut, Mission
 
 api = BoltAPI()
@@ -41,11 +44,66 @@ class MissionResponse(Serializer):
     description: str = ""
 
 
+class MissionListResponse(Serializer):
+    missions: list[MissionResponse]
+    count: int
+
+
+class MissionCreatedResponse(Serializer):
+    id: int
+    name: str
+    status: str
+    message: str
+
+
 class AstronautResponse(Serializer):
     id: int
     name: str
     role: str
     mission_id: int
+
+
+class AstronautCreatedResponse(Serializer):
+    id: int
+    name: str
+    role: str
+    mission: str = field(source="mission.name")
+
+
+class AstronautListResponse(Serializer):
+    mission: str
+    astronauts: list[AstronautResponse]
+
+
+class UploadedDocumentResponse(Serializer):
+    filename: str | None = None
+    content_type: str | None = None
+    size: int | None = None
+
+
+class MissionDocumentsResponse(Serializer):
+    mission: str
+    title: str
+    documents: list[UploadedDocumentResponse]
+    count: int
+
+
+class SecureMissionResponse(Serializer):
+    api_key: str
+    request_id: str | None = None
+    message: str
+
+
+class PreferencesResponse(Serializer):
+    theme: str
+    language: str
+
+
+class MissionReportResponse(Serializer):
+    mission: str
+    title: str
+    summary: str
+    attachments: int
 
 
 # Query parameter model for filtering missions
@@ -67,43 +125,37 @@ class CreateAstronaut(Serializer):
         return value
 
 
+@api.get("/mission-control")
+async def mission_control_status():
+    """Simple status endpoint for the missions example app."""
+    return {"status": "operational", "message": "Mission Control Online"}
+
+
 # Endpoints
 @api.get("/missions")
-async def list_missions(filters: Annotated[MissionFilters, Query()]):
+async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionListResponse:
     """List all missions with optional filtering."""
     queryset = Mission.objects.all()
     if filters.status:
         queryset = queryset.filter(status=filters.status)
-    missions = []
+    missions: list[MissionResponse] = []
     async for mission in queryset[: filters.limit]:
-        missions.append(
-            {
-                "id": mission.id,
-                "name": mission.name,
-                "status": mission.status,
-            }
-        )
-    return {"missions": missions, "count": len(missions)}
+        missions.append(MissionResponse.from_model(mission))
+    return MissionListResponse(missions=missions, count=len(missions))
 
 
 @api.get("/missions/{mission_id}")
-async def get_mission(mission_id: int):
+async def get_mission(mission_id: int) -> MissionResponse:
     """Get a specific mission by ID."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-        return {
-            "id": mission.id,
-            "name": mission.name,
-            "status": mission.status,
-            "launch_date": str(mission.launch_date) if mission.launch_date else None,
-            "description": mission.description,
-        }
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+        return MissionResponse.from_model(mission)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
 
 @api.post("/missions")
-async def create_mission(mission: CreateMission):
+async def create_mission(mission: CreateMission) -> MissionCreatedResponse:
     """Create a new mission."""
     new_mission = await Mission.objects.acreate(
         name=mission.name,
@@ -111,21 +163,21 @@ async def create_mission(mission: CreateMission):
         launch_date=mission.launch_date,
         status="planned",
     )
-    return {
-        "id": new_mission.id,
-        "name": new_mission.name,
-        "status": new_mission.status,
-        "message": "Mission created successfully",
-    }
+    return MissionCreatedResponse(
+        id=new_mission.id,
+        name=new_mission.name,
+        status=new_mission.status,
+        message="Mission created successfully",
+    )
 
 
 @api.put("/missions/{mission_id}")
-async def update_mission(mission_id: int, data: UpdateMission):
+async def update_mission(mission_id: int, data: UpdateMission) -> MissionResponse:
     """Update a mission."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     if data.name is not None:
         mission.name = data.name
@@ -135,7 +187,7 @@ async def update_mission(mission_id: int, data: UpdateMission):
         mission.description = data.description
 
     await mission.asave()
-    return {"id": mission.id, "name": mission.name, "status": mission.status}
+    return MissionResponse.from_model(mission)
 
 
 @api.delete("/missions/{mission_id}", status_code=204)
@@ -143,10 +195,85 @@ async def delete_mission(mission_id: int):
     """Delete a mission."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     await mission.adelete()
+
+
+@api.get("/missions/{mission_id}/classified")
+async def get_classified_info(
+    mission_id: int,
+    clearance: Annotated[str, Header(alias="X-Clearance-Level")],
+):
+    """Return protected mission metadata when the caller has clearance."""
+    if clearance not in ["top-secret", "confidential"]:
+        raise HTTPException(status_code=403, detail="Insufficient clearance level")
+
+    try:
+        mission = await Mission.objects.aget(id=mission_id)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
+
+    return {
+        "mission": mission.name,
+        "classified_data": "Launch codes: APOLLO-7749-OMEGA",
+        "clearance_verified": clearance,
+    }
+
+
+@api.get("/missions/{mission_id}/log")
+async def get_mission_log(mission_id: int):
+    """Return a plain-text mission log."""
+    try:
+        mission = await Mission.objects.aget(id=mission_id)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
+
+    log = f"""
+=== MISSION LOG: {mission.name} ===
+Status: {mission.status.upper()}
+Launch Date: {mission.launch_date or 'TBD'}
+Description: {mission.description or 'No description'}
+================================
+    """.strip()
+
+    return PlainText(log)
+
+
+@api.post("/missions/{mission_id}/patch")
+async def upload_mission_patch(
+    mission_id: int,
+    patch: Annotated[list[dict], File(alias="patch")],
+):
+    """Upload and persist a mission patch image."""
+    try:
+        mission = await Mission.objects.aget(id=mission_id)
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
+
+    if not patch:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    file_info = patch[0]
+    filename = file_info.get("filename", "patch.png")
+    content = file_info.get("content", b"")
+    size = file_info.get("size", 0)
+
+    save_path = f"media/patches/{mission_id}_{filename}"
+    os.makedirs("media/patches", exist_ok=True)
+    with open(save_path, "wb") as patch_file:
+        patch_file.write(content)
+
+    mission.patch_image = save_path
+    await mission.asave()
+
+    return {
+        "message": "Mission patch uploaded successfully",
+        "filename": filename,
+        "size": size,
+        "mission": mission.name,
+    }
 
 
 # Astronaut endpoints
@@ -154,44 +281,33 @@ async def delete_mission(mission_id: int):
 async def add_astronaut(
     mission_id: int,
     data: Annotated[CreateAstronaut, Form()],
-):
+) -> AstronautCreatedResponse:
     """Add an astronaut to a mission."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
     astronaut = await Astronaut.objects.acreate(
         name=data.name,
         role=data.role,
         mission=mission,
     )
-    return {
-        "id": astronaut.id,
-        "name": astronaut.name,
-        "role": astronaut.role,
-        "mission": mission.name,
-    }
+    return await AstronautCreatedResponse.afrom_model(astronaut)
 
 
 @api.get("/missions/{mission_id}/astronauts")
-async def list_astronauts(mission_id: int):
+async def list_astronauts(mission_id: int) -> AstronautListResponse:
     """List all astronauts for a mission."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
-    astronauts = []
+    astronauts: list[AstronautResponse] = []
     async for astronaut in Astronaut.objects.filter(mission=mission):
-        astronauts.append(
-            {
-                "id": astronaut.id,
-                "name": astronaut.name,
-                "role": astronaut.role,
-            }
-        )
-    return {"mission": mission.name, "astronauts": astronauts}
+        astronauts.append(AstronautResponse.from_model(astronaut))
+    return AstronautListResponse(mission=mission.name, astronauts=astronauts)
 
 
 # Header model for API metadata
@@ -212,50 +328,47 @@ async def upload_document(
     mission_id: int,
     title: Annotated[str, Form()],
     files: Annotated[list[dict], File(alias="file")],
-):
+) -> MissionDocumentsResponse:
     """Upload documents for a mission."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
-    uploaded = []
+    uploaded: list[UploadedDocumentResponse] = []
     for f in files:
         uploaded.append(
-            {
-                "filename": f.get("filename"),
-                "content_type": f.get("content_type"),
-                "size": f.get("size"),
-            }
+            UploadedDocumentResponse(
+                filename=f.get("filename"),
+                content_type=f.get("content_type"),
+                size=f.get("size"),
+            )
         )
 
-    return {
-        "mission": mission.name,
-        "title": title,
-        "documents": uploaded,
-        "count": len(uploaded),
-    }
+    return MissionDocumentsResponse(
+        mission=mission.name,
+        title=title,
+        documents=uploaded,
+        count=len(uploaded),
+    )
 
 
 # Header struct endpoint
 @api.get("/missions/secure")
-async def secure_endpoint(headers: Annotated[APIHeaders, Header()]):
+async def secure_endpoint(headers: Annotated[APIHeaders, Header()]) -> SecureMissionResponse:
     """Endpoint requiring API key header."""
-    return {
-        "api_key": headers.x_api_key,
-        "request_id": headers.x_request_id,
-        "message": "Access granted",
-    }
+    return SecureMissionResponse(
+        api_key=headers.x_api_key,
+        request_id=headers.x_request_id,
+        message="Access granted",
+    )
 
 
 # Cookie struct endpoint
 @api.get("/missions/preferences")
-async def get_preferences(cookies: Annotated[UserPreferences, Cookie()]):
+async def get_preferences(cookies: Annotated[UserPreferences, Cookie()]) -> PreferencesResponse:
     """Get user preferences from cookies."""
-    return {
-        "theme": cookies.theme,
-        "language": cookies.language,
-    }
+    return PreferencesResponse(theme=cookies.theme, language=cookies.language)
 
 
 # Mixed form and file upload
@@ -265,18 +378,46 @@ async def submit_report(
     title: Annotated[str, Form()],
     summary: Annotated[str, Form()] = "",
     attachments: Annotated[list[dict], File(alias="file")] = None,
-):
+) -> MissionReportResponse:
     """Submit a mission report with optional attachments."""
     if attachments is None:
         attachments = []
     try:
         mission = await Mission.objects.aget(id=mission_id)
-    except Mission.DoesNotExist:
-        raise NotFound(detail=f"Mission {mission_id} not found")
+    except Mission.DoesNotExist as exc:
+        raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
-    return {
-        "mission": mission.name,
-        "title": title,
-        "summary": summary,
-        "attachments": len(attachments),
-    }
+    return MissionReportResponse(
+        mission=mission.name,
+        title=title,
+        summary=summary,
+        attachments=len(attachments),
+    )
+
+
+@api.get("/status-page")
+async def status_page():
+    """Return a simple HTML status page."""
+    return HTML("<h1>Mission Control: All Systems Operational</h1>")
+
+
+@api.get("/go")
+async def go_to_dashboard():
+    """Redirect to the missions dashboard."""
+    return Redirect("/dashboard")
+
+
+@api.get("/dashboard")
+async def mission_dashboard(request: Request):
+    """Render a small dashboard using a Django template."""
+    missions = []
+    async for mission in Mission.objects.all()[:20]:
+        missions.append(
+            {
+                "name": mission.name,
+                "status": mission.status,
+                "description": mission.description,
+            }
+        )
+
+    return render(request, "missions/dashboard.html", {"missions": missions})

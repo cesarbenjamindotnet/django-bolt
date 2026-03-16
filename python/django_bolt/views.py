@@ -571,8 +571,8 @@ class ListMixin:
                 else:
                     serializer_class = self.serializer_class
 
-                if hasattr(serializer_class, "from_model"):
-                    results.append(serializer_class.from_model(obj))
+                if hasattr(serializer_class, "afrom_model"):
+                    results.append(await serializer_class.afrom_model(obj))
                 else:
                     # Assume it's a msgspec.Struct, use convert
                     fields = getattr(serializer_class, "__annotations__", {})
@@ -609,8 +609,8 @@ class RetrieveMixin:
             else:
                 serializer_class = self.serializer_class
 
-            if hasattr(serializer_class, "from_model"):
-                return serializer_class.from_model(obj)
+            if hasattr(serializer_class, "afrom_model"):
+                return await serializer_class.afrom_model(obj)
             else:
                 # Assume it's a msgspec.Struct, use convert
                 fields = getattr(serializer_class, "__annotations__", {})
@@ -661,8 +661,8 @@ class CreateMixin:
             else:
                 serializer_class = self.serializer_class
 
-            if hasattr(serializer_class, "from_model"):
-                return serializer_class.from_model(obj)
+            if hasattr(serializer_class, "afrom_model"):
+                return await serializer_class.afrom_model(obj)
             else:
                 fields = getattr(serializer_class, "__annotations__", {})
                 mapped = {name: getattr(obj, name, None) for name in fields}
@@ -712,8 +712,8 @@ class UpdateMixin:
             else:
                 serializer_class = self.serializer_class
 
-            if hasattr(serializer_class, "from_model"):
-                return serializer_class.from_model(obj)
+            if hasattr(serializer_class, "afrom_model"):
+                return await serializer_class.afrom_model(obj)
             else:
                 fields = getattr(serializer_class, "__annotations__", {})
                 mapped = {name: getattr(obj, name, None) for name in fields}
@@ -764,8 +764,8 @@ class PartialUpdateMixin:
             else:
                 serializer_class = self.serializer_class
 
-            if hasattr(serializer_class, "from_model"):
-                return serializer_class.from_model(obj)
+            if hasattr(serializer_class, "afrom_model"):
+                return await serializer_class.afrom_model(obj)
             else:
                 fields = getattr(serializer_class, "__annotations__", {})
                 mapped = {name: getattr(obj, name, None) for name in fields}
@@ -935,8 +935,8 @@ class ModelViewSet(ViewSet):
         # Queryset is evaluated here during iteration
         results = []
         async for obj in qs:
-            if hasattr(serializer_class, "from_model"):
-                results.append(serializer_class.from_model(obj))
+            if hasattr(serializer_class, "afrom_model"):
+                results.append(await serializer_class.afrom_model(obj))
             else:
                 # Fallback: manual conversion
                 fields = getattr(serializer_class, "__annotations__", {})
@@ -959,8 +959,8 @@ class ModelViewSet(ViewSet):
         obj = await self.get_object(**{self.lookup_field: lookup_value})
         serializer_class = self.get_serializer_class(action="retrieve")
 
-        if hasattr(serializer_class, "from_model"):
-            return serializer_class.from_model(obj)
+        if hasattr(serializer_class, "afrom_model"):
+            return await serializer_class.afrom_model(obj)
         else:
             fields = getattr(serializer_class, "__annotations__", {})
             mapped = {name: getattr(obj, name, None) for name in fields}
@@ -993,8 +993,8 @@ class ModelViewSet(ViewSet):
 
         # Serialize response
         serializer_class = self.get_serializer_class(action="create")
-        if hasattr(serializer_class, "from_model"):
-            return serializer_class.from_model(obj)
+        if hasattr(serializer_class, "afrom_model"):
+            return await serializer_class.afrom_model(obj)
         else:
             fields = getattr(serializer_class, "__annotations__", {})
             mapped = {name: getattr(obj, name, None) for name in fields}
@@ -1030,8 +1030,8 @@ class ModelViewSet(ViewSet):
 
         # Serialize response
         serializer_class = self.get_serializer_class(action="update")
-        if hasattr(serializer_class, "from_model"):
-            return serializer_class.from_model(obj)
+        if hasattr(serializer_class, "afrom_model"):
+            return await serializer_class.afrom_model(obj)
         else:
             fields = getattr(serializer_class, "__annotations__", {})
             mapped = {name: getattr(obj, name, None) for name in fields}
@@ -1067,8 +1067,8 @@ class ModelViewSet(ViewSet):
 
         # Serialize response
         serializer_class = self.get_serializer_class(action="partial_update")
-        if hasattr(serializer_class, "from_model"):
-            return serializer_class.from_model(obj)
+        if hasattr(serializer_class, "afrom_model"):
+            return await serializer_class.afrom_model(obj)
         else:
             fields = getattr(serializer_class, "__annotations__", {})
             mapped = {name: getattr(obj, name, None) for name in fields}

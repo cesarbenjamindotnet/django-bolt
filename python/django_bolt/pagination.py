@@ -194,7 +194,7 @@ class PaginationBase(ABC):
         else:
             return len(queryset)
 
-    def _serialize_items(self, items: list[Any]) -> list[dict]:
+    async def _serialize_items(self, items: list[Any]) -> list[dict]:
         """
         Serialize items using efficient batch serialization.
 
@@ -228,7 +228,10 @@ class PaginationBase(ABC):
 
         # Bolt Serializer - use from_model + dump_many for efficiency
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):
-            serializer_instances = [self.serializer_class.from_model(item) for item in items]
+            if hasattr(self.serializer_class, "afrom_model"):
+                serializer_instances = [await self.serializer_class.afrom_model(item) for item in items]
+            else:
+                serializer_instances = [self.serializer_class.from_model(item) for item in items]
             return self.serializer_class.dump_many(serializer_instances)
 
         # Plain msgspec.Struct - extract fields from model instances
@@ -397,7 +400,7 @@ class PageNumberPagination(PaginationBase):
         raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + page_size])
 
         # Serialize items using efficient batch serialization
-        items = self._serialize_items(raw_items)
+        items = await self._serialize_items(raw_items)
 
         # Build response
         return PaginatedResponse(
@@ -485,7 +488,7 @@ class LimitOffsetPagination(PaginationBase):
         raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
 
         # Serialize items using efficient batch serialization
-        items = self._serialize_items(raw_items)
+        items = await self._serialize_items(raw_items)
 
         # Calculate page info
         has_next = (offset + limit) < total
@@ -627,7 +630,7 @@ class CursorPagination(PaginationBase):
                 next_cursor = self._encode_cursor(last_value)
 
         # Serialize items using efficient batch serialization
-        items = self._serialize_items(raw_items)
+        items = await self._serialize_items(raw_items)
 
         return PaginatedResponse(
             items=items,
