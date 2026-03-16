@@ -63,6 +63,25 @@ class _ModelFieldSpec:
 
 
 @dataclass(frozen=True)
+class _DumpFieldSpec:
+    """Cached dump metadata for one struct field."""
+
+    field_name: str
+    output_key: str
+    alias: str | None
+    nested: _ModelOutputNested | None
+    default_value: Any = _MISSING
+
+
+@dataclass(frozen=True)
+class _ComputedDumpSpec:
+    """Cached dump metadata for one computed field."""
+
+    field_name: str
+    method_name: str
+
+
+@dataclass(frozen=True)
 class _DjangoRelationInfo:
     """Lightweight cached description of a Django relation accessor."""
 
@@ -132,6 +151,13 @@ def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
         # Forward reference not resolvable yet
         pass
     return rename_map
+
+
+def _resolve_dump_default(default_value: Any) -> Any:
+    """Resolve msgspec/_FieldMarker defaults into their runtime value."""
+    if isinstance(default_value, _FieldMarker) and default_value.config.has_default():
+        return default_value.config.get_default()
+    return default_value
 
 
 def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
@@ -280,6 +306,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __model_validators__: ClassVar[list[Any]] = []
     # Pre-computed tuple of (field_name, validators_tuple) for faster iteration
     __field_validators_tuple__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    _computed_dump_specs: ClassVar[tuple[_ComputedDumpSpec, ...]] = ()
 
     # Cached type hints and metadata (populated by __init_subclass__)
     __cached_type_hints__: ClassVar[dict[str, Any]] = {}
@@ -312,6 +339,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __default_values_map__: ClassVar[dict[str, Any] | None] = None
     # Fast-path flag for dump: True if dump can use simple/fast path
     __dump_fast_path__: ClassVar[bool] = True
+    _dump_field_specs: ClassVar[tuple[_DumpFieldSpec, ...]] = ()
+    _dump_field_spec_cache: ClassVar[
+        dict[tuple[frozenset[str] | None, frozenset[str] | None], tuple[_DumpFieldSpec, ...]]
+    ] = {}
+    _computed_dump_spec_cache: ClassVar[
+        dict[tuple[frozenset[str] | None, frozenset[str] | None], tuple[_ComputedDumpSpec, ...]]
+    ] = {}
+    _serializer_view_cache: ClassVar[dict[tuple[frozenset[str] | None, frozenset[str] | None], Any]] = {}
     # Track if any field is a Serializer type (requires recursive dump)
     __has_serializer_fields__: ClassVar[bool] = False
     # Rename mapping: Python field name -> encoded name (e.g., "user_name" -> "userName")
@@ -327,11 +362,21 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__field_validators__ = collect_field_validators(cls)
         cls.__model_validators__ = collect_model_validators(cls)
         cls.__computed_fields__ = collect_computed_fields(cls)
+        cls._computed_dump_specs = tuple(
+            _ComputedDumpSpec(field_name=field_name, method_name=config.method_name)
+            for field_name, config in cls.__computed_fields__.items()
+        )
 
         # Pre-compute validators as tuple for faster iteration (no dict overhead)
         cls.__field_validators_tuple__ = tuple(
             (field_name, tuple(validators)) for field_name, validators in cls.__field_validators__.items()
         )
+
+        cls.__default_values_map__ = None
+        cls._dump_field_specs = ()
+        cls._dump_field_spec_cache = {}
+        cls._computed_dump_spec_cache = {}
+        cls._serializer_view_cache = {}
 
         # Collect configuration from Meta class (read_only, write_only, field_sets)
         # Note: _FieldMarker processing is deferred to _lazy_collect_field_configs
@@ -492,10 +537,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if cls.__default_values_map__ is not None:
             return
 
+        cls._ensure_dump_ready()
+
         default_values: dict[str, Any] = {}
-        # Use helper to iterate over (field_name, default_value) pairs
-        for field_name, default_val in _iter_field_defaults(cls):
-            default_values[field_name] = default_val
+        for spec in cls._dump_field_specs:
+            if spec.default_value is not _MISSING:
+                default_values[spec.field_name] = spec.default_value
 
         cls.__default_values_map__ = default_values
 
@@ -633,6 +680,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             and not cls.__has_serializer_fields__
             and not any(cfg.exclude for cfg in cls.__field_configs__.values())
         )
+        cls._dump_field_specs = cls._build_dump_field_specs()
+        cls._dump_field_spec_cache.clear()
+        cls._computed_dump_spec_cache.clear()
+        cls._serializer_view_cache.clear()
+        cls.__default_values_map__ = None
 
         # Mark as collected so we don't run again
         cls.__field_configs_collected__ = True
@@ -921,6 +973,108 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """Ensure lazy field metadata has been collected before model extraction."""
         if not cls.__field_configs_collected__:
             cls._lazy_collect_field_configs()
+
+    @classmethod
+    def _ensure_dump_ready(cls) -> None:
+        """Ensure lazy field metadata has been collected before dumping/views."""
+        if not cls.__field_configs_collected__:
+            cls._lazy_collect_field_configs()
+
+    @classmethod
+    def _build_dump_field_specs(cls) -> tuple[_DumpFieldSpec, ...]:
+        """Pre-compute dump metadata for struct fields."""
+        default_values = {
+            field_name: _resolve_dump_default(default_value) for field_name, default_value in _iter_field_defaults(cls)
+        }
+        nested_fields = cls.__nested_fields__
+        rename_map = cls.__rename_map__
+        specs: list[_DumpFieldSpec] = []
+
+        for field_name in cls.__struct_fields__:
+            if field_name in cls.__write_only_fields__:
+                continue
+
+            field_config = cls.__field_configs__.get(field_name)
+            if field_config and field_config.exclude:
+                continue
+
+            specs.append(
+                _DumpFieldSpec(
+                    field_name=field_name,
+                    output_key=rename_map.get(field_name, field_name),
+                    alias=field_config.alias if field_config else None,
+                    nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any))
+                    if field_name in nested_fields
+                    else None,
+                    default_value=default_values.get(field_name, _MISSING),
+                )
+            )
+
+        return tuple(specs)
+
+    @classmethod
+    def _get_dump_field_specs(
+        cls,
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> tuple[_DumpFieldSpec, ...]:
+        """Return cached dump field specs for the requested field filter."""
+        cls._ensure_dump_ready()
+        if include_fields is None and exclude_fields is None:
+            return cls._dump_field_specs
+
+        cache_key = (include_fields, exclude_fields)
+        specs = cls._dump_field_spec_cache.get(cache_key)
+        if specs is None:
+            specs = tuple(
+                spec
+                for spec in cls._dump_field_specs
+                if (include_fields is None or spec.field_name in include_fields)
+                and (exclude_fields is None or spec.field_name not in exclude_fields)
+            )
+            cls._dump_field_spec_cache[cache_key] = specs
+        return specs
+
+    @classmethod
+    def _get_computed_dump_specs(
+        cls,
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> tuple[_ComputedDumpSpec, ...]:
+        """Return cached computed-field specs for the requested field filter."""
+        cls._ensure_dump_ready()
+        if include_fields is None and exclude_fields is None:
+            return cls._computed_dump_specs
+
+        cache_key = (include_fields, exclude_fields)
+        specs = cls._computed_dump_spec_cache.get(cache_key)
+        if specs is None:
+            specs = tuple(
+                spec
+                for spec in cls._computed_dump_specs
+                if (include_fields is None or spec.field_name in include_fields)
+                and (exclude_fields is None or spec.field_name not in exclude_fields)
+            )
+            cls._computed_dump_spec_cache[cache_key] = specs
+        return specs
+
+    @classmethod
+    def _get_cached_view(
+        cls: type[T],
+        *,
+        include_fields: frozenset[str] | None = None,
+        exclude_fields: frozenset[str] | None = None,
+    ) -> SerializerView[T]:
+        """Return a cached SerializerView for a given field-selection pair."""
+        cls._ensure_dump_ready()
+        cache_key = (include_fields, exclude_fields)
+        cached = cls._serializer_view_cache.get(cache_key)
+        if cached is None:
+            cached = SerializerView(cls, include_fields=include_fields, exclude_fields=exclude_fields)
+            cls._serializer_view_cache[cache_key] = cached
+        return cast("SerializerView[T]", cached)
 
     @classmethod
     def _relation_loading_hint(cls, relation: _DjangoRelationInfo) -> str:
@@ -1702,7 +1856,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # Chain with dump_many for lists
             UserSerializer.only("id", "email").dump_many(users)
         """
-        return SerializerView(cls, include_fields=frozenset(fields))
+        return cls._get_cached_view(include_fields=frozenset(fields))
 
     @classmethod
     def exclude(cls: type[T], *fields: str) -> SerializerView[T]:
@@ -1725,7 +1879,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # Chain with dump_many for lists
             UserSerializer.exclude("internal_notes").dump_many(users)
         """
-        return SerializerView(cls, exclude_fields=frozenset(fields))
+        return cls._get_cached_view(exclude_fields=frozenset(fields))
 
     @classmethod
     def use(cls: type[T], field_set: str) -> SerializerView[T]:
@@ -1768,7 +1922,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 f"Field set '{field_set}' not found in {cls.__name__}.Config.field_sets. "
                 f"Available field sets: {available}"
             )
-        return SerializerView(cls, include_fields=frozenset(field_sets[field_set]))
+        return cls._get_cached_view(include_fields=frozenset(field_sets[field_set]))
 
     # -------------------------------------------------------------------------
     # Dump Methods (Serialization)
@@ -1804,8 +1958,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
         cls = self.__class__
-        self._ensure_dumpable_orm_state()
+        cls._ensure_dump_ready()
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
+            self._ensure_dumpable_orm_state()
             if cls.__has_rename__:
                 return msgspec.to_builtins(self)
             return msgspec_structs.asdict(self)
@@ -1829,113 +1984,83 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         by_alias: bool = False,
         include_fields: frozenset[str] | None = None,
         exclude_fields: frozenset[str] | None = None,
+        field_specs: tuple[_DumpFieldSpec, ...] | None = None,
+        computed_specs: tuple[_ComputedDumpSpec, ...] | None = None,
     ) -> dict[str, Any]:
         """Internal implementation of dump with field filtering."""
-        # Cache class attributes locally for faster access in the loop
         cls = self.__class__
-        struct_fields = cls.__struct_fields__
-        write_only_fields = cls.__write_only_fields__
-        field_configs = cls.__field_configs__
-        has_computed = cls.__has_computed_fields__
-        computed_fields = cls.__computed_fields__
-        rename_map = cls.__rename_map__
-
-        # Use pre-computed default values map (computed once per class, not per call)
-        default_values = None
-        if exclude_defaults:
-            # Lazy cache the default values map on first use (None = not cached)
-            if cls.__default_values_map__ is None:
-                cls._cache_default_values_map()
-            default_values = cls.__default_values_map__
+        cls._ensure_dump_ready()
+        field_specs = (
+            field_specs
+            if field_specs is not None
+            else cls._get_dump_field_specs(include_fields=include_fields, exclude_fields=exclude_fields)
+        )
+        computed_specs = (
+            computed_specs
+            if computed_specs is not None
+            else cls._get_computed_dump_specs(include_fields=include_fields, exclude_fields=exclude_fields)
+        )
 
         result: dict[str, Any] = {}
 
         # Local reference to getattr for micro-optimization
         _getattr = getattr
 
-        for field_name in struct_fields:
-            # Skip write_only fields (they shouldn't appear in output)
-            if field_name in write_only_fields:
-                continue
-
-            # Apply include/exclude filtering
-            if include_fields is not None and field_name not in include_fields:
-                continue
-            if exclude_fields is not None and field_name in exclude_fields:
-                continue
-
-            # Check field config for exclusion
-            field_config = field_configs.get(field_name)
-            if field_config and field_config.exclude:
-                continue
-
-            value = _getattr(self, field_name)
+        for spec in field_specs:
+            value = _getattr(self, spec.field_name)
 
             # Skip None values if exclude_none
             if exclude_none and value is None:
                 continue
 
-            # Skip default values if exclude_defaults (using pre-computed map)
-            if default_values is not None and field_name in default_values and value == default_values[field_name]:
+            if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
                 continue
 
             # Determine output key: by_alias takes precedence, then rename_map
-            if by_alias and field_config and field_config.alias:
-                output_key = field_config.alias
-            else:
-                # rename_map.get() returns field_name if not in map (works for empty dict too)
-                output_key = rename_map.get(field_name, field_name)
+            output_key = spec.alias if by_alias and spec.alias else spec.output_key
 
             if isinstance(value, (BaseManager, QuerySet)):
                 raise SerializationError(
-                    f"{cls.__name__}.{field_name} contains {value.__class__.__name__}. "
+                    f"{cls.__name__}.{spec.field_name} contains {value.__class__.__name__}. "
                     "Serialize Django relations with from_model()/afrom_model() before dump()."
                 )
 
-            # Handle nested serializers
-            if isinstance(value, Serializer):
-                result[output_key] = value.dump(
-                    exclude_none=exclude_none,
-                    exclude_unset=exclude_unset,
-                    exclude_defaults=exclude_defaults,
-                    by_alias=by_alias,
-                )
-            elif isinstance(value, list):
-                # Check if it's a list of serializers
-                if value and isinstance(value[0], Serializer):
-                    result[output_key] = [
-                        item.dump(
-                            exclude_none=exclude_none,
-                            exclude_unset=exclude_unset,
-                            exclude_defaults=exclude_defaults,
-                            by_alias=by_alias,
-                        )
-                        for item in value
-                    ]
+            if spec.nested is not None:
+                if spec.nested.many:
+                    if isinstance(value, list) and value and isinstance(value[0], Serializer):
+                        result[output_key] = [
+                            item.dump(
+                                exclude_none=exclude_none,
+                                exclude_unset=exclude_unset,
+                                exclude_defaults=exclude_defaults,
+                                by_alias=by_alias,
+                            )
+                            for item in value
+                        ]
+                    else:
+                        result[output_key] = value
+                elif isinstance(value, Serializer):
+                    result[output_key] = value.dump(
+                        exclude_none=exclude_none,
+                        exclude_unset=exclude_unset,
+                        exclude_defaults=exclude_defaults,
+                        by_alias=by_alias,
+                    )
                 else:
                     result[output_key] = value
             else:
                 result[output_key] = value
 
         # Add computed fields
-        if has_computed:
-            for field_name, config in computed_fields.items():
-                # Apply include/exclude filtering to computed fields too
-                if include_fields is not None and field_name not in include_fields:
+        for spec in computed_specs:
+            method = _getattr(self, spec.method_name, None)
+            if method is not None:
+                value = method()
+
+                if exclude_none and value is None:
                     continue
-                if exclude_fields is not None and field_name in exclude_fields:
-                    continue
 
-                # Get the method and call it
-                method = _getattr(self, config.method_name, None)
-                if method is not None:
-                    value = method()
-
-                    # Skip None values if exclude_none
-                    if exclude_none and value is None:
-                        continue
-
-                    result[field_name] = value
+                result[spec.field_name] = value
 
         return result
 
@@ -2007,6 +2132,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             users = [UserSerializer.from_model(u) for u in User.objects.all()]
             UserSerializer.dump_many(users)
         """
+        cls._ensure_dump_ready()
         instances_list = list(instances)
 
         # FAST PATH: use msgspec native methods (significantly faster than Python iteration)
@@ -2117,6 +2243,8 @@ class SerializerView(Iterable[T]):
         view.from_model(user_instance)
     """
 
+    __slots__ = ("_serializer_class", "_include_fields", "_exclude_fields", "_field_specs", "_computed_specs")
+
     def __init__(
         self,
         serializer_class: type[T],
@@ -2127,6 +2255,14 @@ class SerializerView(Iterable[T]):
         self._serializer_class = serializer_class
         self._include_fields = include_fields
         self._exclude_fields = exclude_fields
+        self._field_specs = serializer_class._get_dump_field_specs(
+            include_fields=include_fields,
+            exclude_fields=exclude_fields,
+        )
+        self._computed_specs = serializer_class._get_computed_dump_specs(
+            include_fields=include_fields,
+            exclude_fields=exclude_fields,
+        )
 
     def __iter__(self):
         """Allow iteration (returns empty iterator - use dump_many instead)."""
@@ -2138,8 +2274,7 @@ class SerializerView(Iterable[T]):
         if self._include_fields is not None:
             # Intersection with existing include
             new_include = self._include_fields & new_include
-        return SerializerView(
-            self._serializer_class,
+        return self._serializer_class._get_cached_view(
             include_fields=new_include,
             exclude_fields=self._exclude_fields,
         )
@@ -2149,8 +2284,7 @@ class SerializerView(Iterable[T]):
         new_exclude = frozenset(fields)
         if self._exclude_fields is not None:
             new_exclude = self._exclude_fields | new_exclude
-        return SerializerView(
-            self._serializer_class,
+        return self._serializer_class._get_cached_view(
             include_fields=self._include_fields,
             exclude_fields=new_exclude,
         )
@@ -2192,6 +2326,8 @@ class SerializerView(Iterable[T]):
             by_alias=by_alias,
             include_fields=self._include_fields,
             exclude_fields=self._exclude_fields,
+            field_specs=self._field_specs,
+            computed_specs=self._computed_specs,
         )
 
     def dump_many(
