@@ -15,6 +15,7 @@ Example:
             return {"user": current_user.id}
 """
 
+import asyncio
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -210,6 +211,15 @@ class APIView:
             if hasattr(cls, method) and callable(getattr(cls, method)):
                 allowed.add(method.upper())
         return allowed
+
+
+async def _serialize_many_results(serializer_class: type[Any], items: list[Any]) -> list[Any]:
+    """Serialize already-loaded instances, parallelizing async serializer work when available."""
+    if hasattr(serializer_class, "afrom_model"):
+        return list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
+
+    fields = getattr(serializer_class, "__annotations__", {})
+    return [msgspec.convert({name: getattr(item, name, None) for name in fields}, serializer_class) for item in items]
 
 
 class ViewSet(APIView):
@@ -560,28 +570,19 @@ class ListMixin:
         if hasattr(self, "filter_queryset"):
             queryset = await self.filter_queryset(queryset)
 
-        # Convert queryset to list (evaluates database query here)
-        results = []
-        async for obj in queryset:
-            # If serializer_class is defined, use it
-            if hasattr(self, "serializer_class") and self.serializer_class:
-                # Get serializer class (use method if available, otherwise direct attribute)
-                if hasattr(self, "get_serializer_class"):
-                    serializer_class = self.get_serializer_class()
-                else:
-                    serializer_class = self.serializer_class
-
-                if hasattr(serializer_class, "afrom_model"):
-                    results.append(await serializer_class.afrom_model(obj))
-                else:
-                    # Assume it's a msgspec.Struct, use convert
-                    fields = getattr(serializer_class, "__annotations__", {})
-                    mapped = {name: getattr(obj, name, None) for name in fields}
-                    results.append(msgspec.convert(mapped, serializer_class))
+        if hasattr(self, "serializer_class") and self.serializer_class:
+            if hasattr(self, "get_serializer_class"):
+                serializer_class = self.get_serializer_class()
             else:
-                results.append(obj)
+                serializer_class = self.serializer_class
+        else:
+            serializer_class = None
 
-        return results
+        items = [obj async for obj in queryset]
+        if serializer_class is None:
+            return items
+
+        return await _serialize_many_results(serializer_class, items)
 
 
 class RetrieveMixin:
@@ -932,18 +933,8 @@ class ModelViewSet(ViewSet):
         qs = await self.filter_queryset(qs)  # Apply filtering (still lazy)
         serializer_class = self.get_serializer_class(action="list")
 
-        # Queryset is evaluated here during iteration
-        results = []
-        async for obj in qs:
-            if hasattr(serializer_class, "afrom_model"):
-                results.append(await serializer_class.afrom_model(obj))
-            else:
-                # Fallback: manual conversion
-                fields = getattr(serializer_class, "__annotations__", {})
-                mapped = {name: getattr(obj, name, None) for name in fields}
-                results.append(msgspec.convert(mapped, serializer_class))
-
-        return results
+        items = [obj async for obj in qs]
+        return await _serialize_many_results(serializer_class, items)
 
     async def retrieve(self, request, **kwargs):
         """

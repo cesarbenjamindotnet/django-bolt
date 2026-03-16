@@ -140,7 +140,7 @@ async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionL
         queryset = queryset.filter(status=filters.status)
     missions: list[MissionResponse] = []
     async for mission in queryset[: filters.limit]:
-        missions.append(MissionResponse.from_model(mission))
+        missions.append(await MissionResponse.afrom_model(mission))
     return MissionListResponse(missions=missions, count=len(missions))
 
 
@@ -149,7 +149,7 @@ async def get_mission(mission_id: int) -> MissionResponse:
     """Get a specific mission by ID."""
     try:
         mission = await Mission.objects.aget(id=mission_id)
-        return MissionResponse.from_model(mission)
+        return await MissionResponse.afrom_model(mission)
     except Mission.DoesNotExist as exc:
         raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
@@ -187,7 +187,7 @@ async def update_mission(mission_id: int, data: UpdateMission) -> MissionRespons
         mission.description = data.description
 
     await mission.asave()
-    return MissionResponse.from_model(mission)
+    return await MissionResponse.afrom_model(mission)
 
 
 @api.delete("/missions/{mission_id}", status_code=204)
@@ -306,7 +306,7 @@ async def list_astronauts(mission_id: int) -> AstronautListResponse:
 
     astronauts: list[AstronautResponse] = []
     async for astronaut in Astronaut.objects.filter(mission=mission):
-        astronauts.append(AstronautResponse.from_model(astronaut))
+        astronauts.append(await AstronautResponse.afrom_model(astronaut))
     return AstronautListResponse(mission=mission.name, astronauts=astronauts)
 
 

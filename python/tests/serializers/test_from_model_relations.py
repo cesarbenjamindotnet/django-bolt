@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from msgspec import structs as msgspec_structs
 
@@ -21,6 +23,11 @@ class CommentMiniSerializer(Serializer):
 class UserMiniSerializer(Serializer):
     id: int
     username: str
+
+
+class AuthorMiniSerializer(Serializer):
+    id: int
+    name: str
 
 
 class AuthorWithPlainPostsSerializer(Serializer):
@@ -49,10 +56,34 @@ class UserProfileOutputSerializer(Serializer):
     user: UserMiniSerializer
 
 
+class UserProfileMiniSerializer(Serializer):
+    id: int
+    bio: str
+
+
 class UserWithProfileBioSerializer(Serializer):
     id: int
     username: str
     profile_bio: str | None = field(source="profile.bio", default=None)
+
+
+class UserWithProfileSerializer(Serializer):
+    id: int
+    username: str
+    profile: UserProfileMiniSerializer
+    profile_bio: str | None = field(source="profile.bio", default=None)
+
+
+class BlogPostWithAuthorAndCommentsSerializer(Serializer):
+    id: int
+    title: str
+    author: AuthorMiniSerializer
+    comments: list[CommentMiniSerializer] = field(default_factory=list)
+
+
+class AuthorPostIdsSerializer(Serializer):
+    id: int
+    post_ids: list[int] = field(default_factory=list)
 
 
 @pytest.mark.django_db
@@ -145,6 +176,75 @@ async def test_afrom_model_lazy_loads_forward_fk_and_source_paths():
     assert user_serializer.profile_bio == "Hello"
 
 
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_afrom_model_reuses_inflight_relation_load_for_shared_source_path(monkeypatch):
+    user = await User.objects.acreate(
+        username="alice",
+        email="alice@example.com",
+        password_hash="hash",
+    )
+    await UserProfile.objects.acreate(user=user, bio="Hello", location="Earth")
+
+    user = await User.objects.aget(id=user.id)
+    original_loader = Serializer._load_relation_async.__func__
+    load_calls: list[str] = []
+
+    async def tracked_loader(cls, obj, relation):
+        if obj.__class__ is User and obj.pk == user.pk:
+            load_calls.append(relation.name)
+        return await original_loader(cls, obj, relation)
+
+    monkeypatch.setattr(
+        UserWithProfileSerializer,
+        "_load_relation_async",
+        classmethod(tracked_loader),
+    )
+
+    serializer = await UserWithProfileSerializer.afrom_model(user)
+
+    assert serializer.profile.bio == "Hello"
+    assert serializer.profile_bio == "Hello"
+    assert load_calls == ["profile"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_afrom_model_loads_multiple_unloaded_relations_concurrently(monkeypatch):
+    author = await Author.objects.acreate(name="Alice", email="alice@example.com")
+    post = await BlogPost.objects.acreate(title="Post 1", content="One", author=author)
+    commenter = await Author.objects.acreate(name="Bob", email="bob@example.com")
+    await Comment.objects.acreate(post=post, author=commenter, text="Nice post")
+
+    post = await BlogPost.objects.aget(id=post.id)
+    original_loader = Serializer._load_relation_async.__func__
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    seen_relations: list[str] = []
+
+    async def tracked_loader(cls, obj, relation):
+        if obj.__class__ is BlogPost and obj.pk == post.pk and relation.name in {"author", "comments"}:
+            seen_relations.append(relation.name)
+            if not first_started.is_set():
+                first_started.set()
+                await asyncio.wait_for(second_started.wait(), timeout=0.5)
+            else:
+                second_started.set()
+        return await original_loader(cls, obj, relation)
+
+    monkeypatch.setattr(
+        BlogPostWithAuthorAndCommentsSerializer,
+        "_load_relation_async",
+        classmethod(tracked_loader),
+    )
+
+    serializer = await BlogPostWithAuthorAndCommentsSerializer.afrom_model(post)
+
+    assert serializer.author.name == "Alice"
+    assert len(serializer.comments) == 1
+    assert set(seen_relations) == {"author", "comments"}
+
+
 @pytest.mark.django_db
 def test_from_model_unloaded_source_path_uses_default_without_querying():
     user = User.objects.create(
@@ -172,3 +272,29 @@ def test_dump_fails_fast_when_manager_leaks_into_serializer_state():
         serializer.dump()
 
     assert "Serialize Django relations with from_model()/afrom_model()" in str(exc_info.value)
+
+
+@pytest.mark.django_db
+def test_dump_fast_path_still_guards_collection_fields_for_manager_leaks():
+    author = Author.objects.create(name="Alice", email="alice@example.com")
+    serializer = AuthorPostIdsSerializer(id=author.id)
+
+    msgspec_structs.force_setattr(serializer, "post_ids", author.posts)
+
+    with pytest.raises(SerializationError) as exc_info:
+        serializer.dump()
+
+    assert "post_ids" in str(exc_info.value)
+
+
+@pytest.mark.django_db
+def test_dump_many_fast_path_still_guards_collection_fields_for_manager_leaks():
+    author = Author.objects.create(name="Alice", email="alice@example.com")
+    serializer = AuthorPostIdsSerializer(id=author.id)
+
+    msgspec_structs.force_setattr(serializer, "post_ids", author.posts)
+
+    with pytest.raises(SerializationError) as exc_info:
+        AuthorPostIdsSerializer.dump_many([serializer])
+
+    assert "post_ids" in str(exc_info.value)

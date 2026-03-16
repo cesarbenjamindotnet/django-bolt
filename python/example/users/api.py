@@ -418,7 +418,7 @@ class UserPaginatedViewSet(ViewSet):
     async def retrieve(self, request, id: int) -> UserDetailSerializer:
         """Retrieve a single user by ID (not paginated)."""
         user = await self.get_object(id=id)
-        return UserDetailSerializer.from_model(user)
+        return await UserDetailSerializer.afrom_model(user)
 
 
 # ----------------------------------------------------------------------------

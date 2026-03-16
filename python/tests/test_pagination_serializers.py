@@ -7,6 +7,8 @@ or return type annotation for efficient batch serialization.
 
 from __future__ import annotations
 
+import asyncio
+
 import msgspec
 import pytest
 
@@ -61,6 +63,10 @@ class BlogPostListSerializer(Serializer):
     id: int
     title: str
     author: AuthorNestedSerializer
+
+
+class ConcurrentBlogPostListSerializer(BlogPostListSerializer):
+    """Serializer used to verify page item serialization runs concurrently."""
 
 
 # ============================================================================
@@ -251,6 +257,47 @@ def test_paginate_with_nested_serializer_uses_afrom_model(sample_blog_posts):
         assert len(data["items"]) == 5
         first_item = data["items"][0]
         assert first_item["author"]["name"].startswith("Author ")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginate_serializes_page_items_concurrently(sample_blog_posts, monkeypatch):
+    """Test paginated async serialization gathers item-level afrom_model() calls."""
+    api = BoltAPI()
+    original_afrom_model = Serializer.afrom_model.__func__
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    seen_ids: list[int] = []
+
+    async def tracked_afrom_model(cls, instance, *, _depth=0, max_depth=10):
+        seen_ids.append(instance.pk)
+        if not first_started.is_set():
+            first_started.set()
+            await asyncio.wait_for(second_started.wait(), timeout=0.5)
+        else:
+            second_started.set()
+        return await original_afrom_model(cls, instance, _depth=_depth, max_depth=max_depth)
+
+    monkeypatch.setattr(
+        ConcurrentBlogPostListSerializer,
+        "afrom_model",
+        classmethod(tracked_afrom_model),
+    )
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 2
+
+    @api.get("/posts", response_model=list[ConcurrentBlogPostListSerializer])
+    @paginate(SmallPagePagination)
+    async def list_posts(request):
+        return BlogPost.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/posts?page=1")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert len(data["items"]) == 2
+        assert len(seen_ids) == 2
 
 
 # ============================================================================

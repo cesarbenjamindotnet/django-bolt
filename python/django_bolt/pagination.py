@@ -21,6 +21,7 @@ Example (Class-Based View):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 from abc import ABC, abstractmethod
@@ -228,10 +229,9 @@ class PaginationBase(ABC):
 
         # Bolt Serializer - use from_model + dump_many for efficiency
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):
-            if hasattr(self.serializer_class, "afrom_model"):
-                serializer_instances = [await self.serializer_class.afrom_model(item) for item in items]
-            else:
-                serializer_instances = [self.serializer_class.from_model(item) for item in items]
+            serializer_instances = list(
+                await asyncio.gather(*(self.serializer_class.afrom_model(item) for item in items))
+            )
             return self.serializer_class.dump_many(serializer_instances)
 
         # Plain msgspec.Struct - extract fields from model instances
