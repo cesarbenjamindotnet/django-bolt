@@ -42,6 +42,23 @@ def test_nested_rejects_removed_positional_api():
         Nested(many=True)  # type: ignore
 
 
+def test_nested_rejects_old_serializer_class_api_with_helpful_message():
+    """Test that the removed Nested(ChildSerializer) API gives migration guidance."""
+
+    class AuthorSerializer(Serializer):
+        id: int
+        username: str
+
+    with pytest.raises(TypeError) as exc_info:
+        Nested(AuthorSerializer)  # type: ignore[arg-type]
+
+    message = str(exc_info.value)
+    assert "no longer accepts serializer classes or many=" in message
+    assert "Nested fields are inferred from the type annotation." in message
+    assert "Use ChildSerializer or list[ChildSerializer]" in message
+    assert "Annotated[..., Nested(max_items=...)]" in message
+
+
 def test_nested_annotation():
     """Test nested serializers inferred from plain serializer types."""
 

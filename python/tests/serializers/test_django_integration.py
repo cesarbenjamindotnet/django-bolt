@@ -1092,6 +1092,35 @@ class TestCreateSerializerHelpersWithDjango:
         assert "is_active" in UserSerializer.__annotations__
 
     @pytest.mark.django_db
+    def test_create_serializer_config_applies_end_to_end(self):
+        """Test create_serializer uses Config metadata for model mapping and dump behavior."""
+        UserGeneratedSerializer = create_serializer(
+            User,
+            fields=["id", "username", "email", "password_hash", "created_at"],
+            write_only={"password_hash"},
+            read_only={"id", "created_at"},
+            serializer_name="UserGeneratedSerializer",
+        )
+
+        user = User.objects.create(
+            username="helperuser",
+            email="helper@example.com",
+            password_hash="super-secret",
+        )
+
+        serializer = UserGeneratedSerializer.from_model(user)
+        dumped = serializer.dump()
+
+        assert UserGeneratedSerializer.Config.model is User
+        assert UserGeneratedSerializer.__write_only_fields__ == frozenset({"password_hash"})
+        assert UserGeneratedSerializer.__read_only_fields__ == frozenset({"id", "created_at"})
+        assert dumped["id"] == user.id
+        assert dumped["username"] == "helperuser"
+        assert dumped["email"] == "helper@example.com"
+        assert "created_at" in dumped
+        assert "password_hash" not in dumped
+
+    @pytest.mark.django_db
     def test_create_serializer_set_with_django(self):
         """Test create_serializer_set with Django model."""
         from django.contrib.auth.models import User as DjangoUser  # noqa: PLC0415
