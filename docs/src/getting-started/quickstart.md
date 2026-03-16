@@ -482,6 +482,8 @@ So far we've been building response dicts by hand. That's a great way to learn t
 Once the same response shapes start showing up in multiple endpoints, move them into `Serializer` classes too. That gives you reusable, typed response contracts and keeps the model-to-JSON mapping in one place.
 
 ```python
+import asyncio
+
 from django_bolt.serializers import Serializer, field
 
 
@@ -523,9 +525,11 @@ async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionL
     if filters.status:
         queryset = queryset.filter(status=filters.status)
 
-    missions: list[MissionResponse] = []
-    async for mission in queryset[:filters.limit]:
-        missions.append(await MissionResponse.afrom_model(mission))
+    mission_tasks = [
+        MissionResponse.afrom_model(mission)
+        async for mission in queryset[:filters.limit]
+    ]
+    missions = list(await asyncio.gather(*mission_tasks))
 
     return MissionListResponse(missions=missions, count=len(missions))
 
@@ -732,6 +736,7 @@ Here's the complete `missions/api.py` file:
 ```python
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime
 from typing import Annotated, Literal
@@ -846,9 +851,11 @@ async def list_missions(filters: Annotated[MissionFilters, Query()]) -> MissionL
     if filters.status:
         queryset = queryset.filter(status=filters.status)
 
-    missions: list[MissionResponse] = []
-    async for mission in queryset[:filters.limit]:
-        missions.append(await MissionResponse.afrom_model(mission))
+    mission_tasks = [
+        MissionResponse.afrom_model(mission)
+        async for mission in queryset[:filters.limit]
+    ]
+    missions = list(await asyncio.gather(*mission_tasks))
     return MissionListResponse(missions=missions, count=len(missions))
 
 
@@ -988,9 +995,11 @@ async def list_astronauts(mission_id: int) -> AstronautListResponse:
     except Mission.DoesNotExist as exc:
         raise NotFound(detail=f"Mission {mission_id} not found") from exc
 
-    astronauts: list[AstronautResponse] = []
-    async for astronaut in Astronaut.objects.filter(mission=mission):
-        astronauts.append(await AstronautResponse.afrom_model(astronaut))
+    astronaut_tasks = [
+        AstronautResponse.afrom_model(astronaut)
+        async for astronaut in Astronaut.objects.filter(mission=mission)
+    ]
+    astronauts = list(await asyncio.gather(*astronaut_tasks))
     return AstronautListResponse(mission=mission.name, astronauts=astronauts)
 
 

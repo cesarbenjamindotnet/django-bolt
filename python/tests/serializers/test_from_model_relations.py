@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 from msgspec import structs as msgspec_structs
@@ -84,6 +85,11 @@ class BlogPostWithAuthorAndCommentsSerializer(Serializer):
 class AuthorPostIdsSerializer(Serializer):
     id: int
     post_ids: list[int] = field(default_factory=list)
+
+
+class AuthorPayloadSerializer(Serializer):
+    id: int
+    payload: Any = None
 
 
 @pytest.mark.django_db
@@ -275,26 +281,36 @@ def test_dump_fails_fast_when_manager_leaks_into_serializer_state():
 
 
 @pytest.mark.django_db
-def test_dump_fast_path_still_guards_collection_fields_for_manager_leaks():
-    author = Author.objects.create(name="Alice", email="alice@example.com")
-    serializer = AuthorPostIdsSerializer(id=author.id)
+def test_scalar_list_fields_are_not_marked_for_orm_state_checks():
+    class AuthorTagNamesSerializer(Serializer):
+        id: int
+        tag_names: list[str] = field(default_factory=list)
 
-    msgspec_structs.force_setattr(serializer, "post_ids", author.posts)
+    assert AuthorPostIdsSerializer.__orm_state_check_fields__ == ()
+    assert AuthorTagNamesSerializer.__orm_state_check_fields__ == ()
+
+
+@pytest.mark.django_db
+def test_dump_fast_path_still_guards_any_fields_for_manager_leaks():
+    author = Author.objects.create(name="Alice", email="alice@example.com")
+    serializer = AuthorPayloadSerializer(id=author.id)
+
+    msgspec_structs.force_setattr(serializer, "payload", author.posts)
 
     with pytest.raises(SerializationError) as exc_info:
         serializer.dump()
 
-    assert "post_ids" in str(exc_info.value)
+    assert "payload" in str(exc_info.value)
 
 
 @pytest.mark.django_db
-def test_dump_many_fast_path_still_guards_collection_fields_for_manager_leaks():
+def test_dump_many_fast_path_still_guards_any_fields_for_manager_leaks():
     author = Author.objects.create(name="Alice", email="alice@example.com")
-    serializer = AuthorPostIdsSerializer(id=author.id)
+    serializer = AuthorPayloadSerializer(id=author.id)
 
-    msgspec_structs.force_setattr(serializer, "post_ids", author.posts)
+    msgspec_structs.force_setattr(serializer, "payload", author.posts)
 
     with pytest.raises(SerializationError) as exc_info:
-        AuthorPostIdsSerializer.dump_many([serializer])
+        AuthorPayloadSerializer.dump_many([serializer])
 
-    assert "post_ids" in str(exc_info.value)
+    assert "payload" in str(exc_info.value)

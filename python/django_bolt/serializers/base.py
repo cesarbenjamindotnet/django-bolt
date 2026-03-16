@@ -29,6 +29,7 @@ from typing import (
 from weakref import WeakKeyDictionary
 
 import msgspec
+from django.core.exceptions import FieldDoesNotExist
 from django.db.models import Model as DjangoModel
 from django.db.models.manager import BaseManager
 from django.db.models.query import QuerySet
@@ -197,7 +198,22 @@ def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
 
 def _field_type_may_hold_orm_state(field_type: Any) -> bool:
     """Return True when a field type could plausibly hold a manager/queryset at runtime."""
-    if field_type in {Any, object, BaseManager, QuerySet, DjangoModel}:
+    if field_type in {
+        Any,
+        object,
+        BaseManager,
+        QuerySet,
+        DjangoModel,
+        list,
+        tuple,
+        set,
+        frozenset,
+        dict,
+        Collection,
+        Iterable,
+        Mapping,
+        Sequence,
+    }:
         return True
 
     origin = get_origin(field_type)
@@ -207,15 +223,16 @@ def _field_type_may_hold_orm_state(field_type: Any) -> bool:
     if origin is Literal:
         return False
 
-    if origin in {list, tuple, set, frozenset, dict, Collection, Iterable, Mapping, Sequence}:
-        return True
-
     if origin in {Union, UnionType}:
         return any(_field_type_may_hold_orm_state(arg) for arg in get_args(field_type) if arg is not type(None))
 
     if origin is Annotated:
         args = get_args(field_type)
         return bool(args) and _field_type_may_hold_orm_state(args[0])
+
+    if origin in {list, tuple, set, frozenset, dict, Collection, Iterable, Mapping, Sequence}:
+        args = tuple(arg for arg in get_args(field_type) if arg not in {type(None), Ellipsis})
+        return not args or any(_field_type_may_hold_orm_state(arg) for arg in args)
 
     return False
 
@@ -239,7 +256,7 @@ def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelatio
 
     try:
         field = meta.get_field(attr_name)
-    except Exception:
+    except FieldDoesNotExist:
         model_cache[attr_name] = None
         return None
 
