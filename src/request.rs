@@ -164,7 +164,7 @@ impl PyRequest {
     /// Values are pre-typed by Rust (int, float, bool, str).
     ///
     /// Example:
-    ///     id_ = request.query.get("id", 1)
+    ///     id_ = request.params.get("id", 1)
     #[getter]
     #[inline]
     fn params<'py>(&self, py: Python<'py>) -> Py<PyDict> {
