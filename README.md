@@ -9,7 +9,7 @@
 
 # High-Performance Fully Typed API Framework for Django
 
-Your first question might be: why? Well, consider this: **Faster than _FastAPI_, but with Django ORM, Django Admin, and Django packages**. That’s exactly what this project achieves. Django-Bolt is a high-performance API framework for Django, providing Rust-powered API endpoints capable of 60k+ RPS. Similar to Django REST Framework or Django Ninja, it integrates seamlessly with existing Django projects while leveraging Actix Web for HTTP handling, PyO3 to bridge Python async handlers with Rust's async runtime, and msgspec for fast serialization. You can deploy it directly—no gunicorn or uvicorn needed.
+Your first question might be: why? Well, consider this: **Faster than _FastAPI_, but with Django ORM, Django Admin, and Django packages**. That’s exactly what this project achieves. Django-Bolt is a high-performance API framework for Django, providing Rust-powered API endpoints capable of 188k+ RPS. Similar to Django REST Framework or Django Ninja, it integrates seamlessly with existing Django projects while leveraging Actix Web for HTTP handling, PyO3 to bridge Python async handlers with Rust's async runtime, and msgspec for fast serialization. You can deploy it directly—no gunicorn or uvicorn needed.
 
 ## 🚀 Quick Start
 
@@ -85,13 +85,13 @@ python manage.py runbolt --dev
 
 | Endpoint Type                  | Requests/sec     |
 | ------------------------------ | ---------------- |
-| Root endpoint                  | **~100,000 RPS** |
-| JSON parsing/validation (10kb) | **~83,700 RPS**  |
-| Path + Query parameters        | **~85,300 RPS**  |
-| HTML response                  | **~100,600 RPS** |
+| Root endpoint                  | **~188,100 RPS** |
+| JSON parsing/validation (10kb) | **~128,400 RPS** |
+| Path + Query parameters        | **~163,200 RPS** |
+| HTML response                  | **~164,100 RPS** |
 | Redirect response              | **~96,300 RPS**  |
-| Form data handling             | **~76,800 RPS**  |
-| ORM reads (SQLite, 10 records) | **~13,000 RPS**  |
+| Form data handling             | **~143,900 RPS** |
+| ORM reads (SQLite, 10 records) | **~14,800 RPS**  |
 
 ### Streaming Performance (Async)
 
