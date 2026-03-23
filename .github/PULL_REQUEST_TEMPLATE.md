@@ -1,4 +1,3 @@
-## What does this PR do?
 
 <!-- Describe the change in 2-3 sentences. Link to any related issue. -->
 
