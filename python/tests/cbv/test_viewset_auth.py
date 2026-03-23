@@ -70,7 +70,7 @@ def test_viewset_auth(api, view_classes: list[type]):
         assert response.status_code == 401
 
         response = client.post(
-            "/articles", json={"data": {"title": "New Article", "content": "New Content", "author": "New Author"}}
+            "/articles", json={"title": "New Article", "content": "New Content", "author": "New Author"}
         )
         assert response.status_code == 401
 
@@ -88,7 +88,7 @@ def test_viewset_auth(api, view_classes: list[type]):
 
         response = client.post(
             "/articles",
-            json={"data": {"title": "New Article", "content": "New Content", "author": "New Author"}},
+            json={"title": "New Article", "content": "New Content", "author": "New Author"},
             headers=headers,
         )
         assert response.status_code == 201

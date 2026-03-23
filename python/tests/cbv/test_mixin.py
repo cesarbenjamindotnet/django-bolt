@@ -33,6 +33,7 @@ class ArticleListSchema(Serializer):
     id: int
     title: str
 
+
 class ArticleCreateSchema(Serializer):
     title: str
     content: str
@@ -193,8 +194,6 @@ def test_retrieve_mixin(api, view_classes: list[type]):
         assert data["content"] == "Retrieve Content"
 
 
-
-
 @pytest.mark.parametrize(
     "view_classes",
     [
@@ -213,7 +212,7 @@ def test_create_mixin(api, view_classes: list[type]):
     with TestClient(api) as client:
         response = client.post(
             "/articles",
-            json={"data": {"title": "Create Title", "content": "Create Content", "author": "Author 1"}},
+            json={"title": "Create Title", "content": "Create Content", "author": "Author 1"},
         )
         assert response.status_code == 201
         data = response.json()
@@ -242,7 +241,7 @@ def test_update_mixin(api, view_classes: list[type]):
     with TestClient(api) as client:
         response = client.put(
             f"/articles/{article.id}",
-            json={"data": {"title": "Updated Title", "content": "Updated Content", "author": "Author 1"}},
+            json={"title": "Updated Title", "content": "Updated Content", "author": "Author 1"},
         )
         assert response.status_code == 200
         data = response.json()
@@ -270,7 +269,7 @@ def test_partial_update_mixin(api, view_classes: list[type]):
     with TestClient(api) as client:
         response = client.patch(
             f"/articles/{article.id}",
-            json={"data": {"title": "Patched Title"}},
+            json={"title": "Patched Title"},
         )
         assert response.status_code == 200
         data = response.json()
@@ -355,7 +354,7 @@ def test_write_by_custom_lookup_field(api, view_classes: list[type]):
         # Test create
         response = client.post(
             "/articles",
-            json={"data": {"title": "unique_title", "content": "Content", "author": "Author"}},
+            json={"title": "unique_title", "content": "Content", "author": "Author"},
         )
         assert response.status_code == 201
         data = response.json()
@@ -365,7 +364,7 @@ def test_write_by_custom_lookup_field(api, view_classes: list[type]):
         # Test update by title
         response = client.put(
             "/articles/unique_title",
-            json={"data": {"title": "unique_title", "content": "Updated Content", "author": "Updated Author"}},
+            json={"title": "unique_title", "content": "Updated Content", "author": "Updated Author"},
         )
         assert response.status_code == 200
         data = response.json()
@@ -377,7 +376,7 @@ def test_write_by_custom_lookup_field(api, view_classes: list[type]):
         # Test partial update by title
         response = client.patch(
             "/articles/unique_title",
-            json={"data": {"content": "Patched Content"}},
+            json={"content": "Patched Content"},
         )
         assert response.status_code == 200
         data = response.json()
@@ -607,7 +606,7 @@ def test_list_and_retrieve_different_serializers(api, view_classes: list[type]):
         # Test create uses ArticleCreateSchema (accepts title, content, author)
         response = client.post(
             "/articles",
-            json={"data": {"title": "New Title", "content": "New Content", "author": "New Author"}},
+            json={"title": "New Title", "content": "New Content", "author": "New Author"},
         )
         assert response.status_code == 201
         create_data = response.json()
@@ -627,7 +626,7 @@ def test_list_and_retrieve_different_serializers(api, view_classes: list[type]):
         # ignore author
         response = client.put(
             f"/articles/{article1.id}",
-            json={"data": {"title": "Updated Title", "content": "Updated Content", "author": "Updated Author"}},
+            json={"title": "Updated Title", "content": "Updated Content", "author": "Updated Author"},
         )
         assert response.status_code == 200
         update_data = response.json()
@@ -649,7 +648,7 @@ def test_list_and_retrieve_different_serializers(api, view_classes: list[type]):
         # ignore author
         response = client.patch(
             f"/articles/{article2.id}",
-            json={"data": {"title": "Patched Title", "author": "Patched Author"}},
+            json={"title": "Patched Title", "author": "Patched Author"},
         )
         assert response.status_code == 200
         patch_data = response.json()
