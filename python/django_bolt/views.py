@@ -15,7 +15,6 @@ Example:
             return {"user": current_user.id}
 """
 
-import asyncio
 import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -23,12 +22,11 @@ from typing import TYPE_CHECKING, Any
 from django.db.models import Model, ObjectDoesNotExist, QuerySet
 from django.forms.models import model_to_dict
 
-from django_bolt.request import is_request
-from django_bolt.serializers.base import Serializer
-
+from ._json import decode
 from .exceptions import HTTPException
 from .pagination import PaginationBase
-from .request import Request
+from .request import Request, is_request
+from .serializers.base import Serializer
 
 
 class APIView:
@@ -490,10 +488,6 @@ else:
     _ViewSet = object
 
 
-class WritePayload(Serializer):
-    data: dict
-
-
 class ListMixin(_ViewSet):
     """
     Mixin that provides a list() method for GET requests on collections.
@@ -536,16 +530,18 @@ class CreateMixin(_ViewSet):
         async def post(self, request, data: SerializerClass) -> object
     """
 
-    async def create(self, request: Request, data: WritePayload):
+    async def create(self, request: Request):
         """
         Create a new object.
 
         The `data` parameter should be a msgspec.Struct with the fields to create.
         Uses create_serializer_class if defined, otherwise serializer_class.
         """
+        data = decode(request.body)
+
         # Use serializer validate data
         serializer_class = self.get_serializer_class("create")
-        validated_obj = serializer_class.model_validate(data.data)
+        validated_obj = serializer_class.model_validate(data)
 
         # Get the model class
         model = (await self.get_queryset()).model
@@ -565,13 +561,14 @@ class UpdateMixin(_ViewSet):
         async def update(self, request, data: SerializerClass) -> object
     """
 
-    async def update(self, request: Request, data: WritePayload):
+    async def update(self, request: Request):
         """Update an object (full update)."""
+        data = decode(request.body)
         obj = await self.get_object()
 
         # Use serializer validate data
         serializer_class = self.get_serializer_class("update")
-        validated_obj = serializer_class.model_validate(data.data)
+        validated_obj = serializer_class.model_validate(data)
 
         # Update object fields
         for key, value in validated_obj.to_dict().items():
@@ -591,13 +588,14 @@ class PartialUpdateMixin(_ViewSet):
         async def partial_update(self, request: Request, data: SerializerClass) -> object
     """
 
-    async def partial_update(self, request: Request, data: WritePayload):
+    async def partial_update(self, request: Request):
         """Update an object (partial update)."""
+        data = decode(request.body)
         obj = await self.get_object()
 
         # Extract only fields that exist in the serializer's struct_fields from the incoming data
         serializer_class = self.get_serializer_class("update")
-        patch_data = {field: data.data[field] for field in serializer_class.__struct_fields__ if field in data.data}
+        patch_data = {field: data[field] for field in serializer_class.__struct_fields__ if field in data}
 
         # Patch object fields
         for key, value in patch_data.items():
@@ -702,5 +700,5 @@ class ModelViewSet(
     parameter binding and validation. Routes are automatically generated based on
     implemented action methods.
     """
-    pass
 
+    pass

@@ -99,7 +99,7 @@ def test_model_viewset_crud(api):
         # Create
         response = client.post(
             "/articles",
-            json={"data": {"title": "New Article", "content": "New Content", "author": "Test Author"}},
+            json={"title": "New Article", "content": "New Content", "author": "Test Author"},
         )
         assert response.status_code == 201
         article_id = response.json()["id"]
@@ -112,7 +112,7 @@ def test_model_viewset_crud(api):
         # Update
         response = client.put(
             f"/articles/{article_id}",
-            json={"data": {"title": "Updated Title", "content": "Updated Content", "author": "Updated Author"}},
+            json={"title": "Updated Title", "content": "Updated Content", "author": "Updated Author"},
         )
         assert response.status_code == 200
         assert response.json()["title"] == "Updated Title"
@@ -120,7 +120,7 @@ def test_model_viewset_crud(api):
         # Partial update
         response = client.patch(
             f"/articles/{article_id}",
-            json={"data": {"title": "Patched Title"}},
+            json={"title": "Patched Title"},
         )
         assert response.status_code == 200
         assert response.json()["title"] == "Patched Title"

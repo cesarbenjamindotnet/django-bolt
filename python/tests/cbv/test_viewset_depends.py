@@ -17,7 +17,6 @@ from django_bolt import (
 from django_bolt.params import Depends
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
-from django_bolt.views import WritePayload
 from tests.test_models import Article
 
 
@@ -93,35 +92,32 @@ def test_viewset_custom_curd_depends(api, view_classes: list[type]):
         async def create(
             self,
             request,
-            data: WritePayload,
             user: Annotated[User, Depends(get_user)],
             settings: Annotated[dict, Depends(get_settings)] = None,
         ):
             assert user == di_user
             assert settings == di_settings
-            return await super().create(request, data=data)
+            return await super().create(request)
 
         async def update(
             self,
             request,
-            data: WritePayload,
             user: Annotated[User, Depends(get_user)],
             settings: Annotated[dict, Depends(get_settings)] = None,
         ):
             assert user == di_user
             assert settings == di_settings
-            return await super().update(request, data=data)
+            return await super().update(request)
 
         async def partial_update(
             self,
             request,
-            data: WritePayload,
             user: Annotated[User, Depends(get_user)],
             settings: Annotated[dict, Depends(get_settings)] = None,
         ):
             assert user == di_user
             assert settings == di_settings
-            return await super().partial_update(request, data=data)
+            return await super().partial_update(request)
 
         async def destroy(
             self,
@@ -139,7 +135,7 @@ def test_viewset_custom_curd_depends(api, view_classes: list[type]):
         assert r.status_code == 200
 
         # Create an article first to test other methods
-        article_data = {"data": {"title": "Test Article", "content": "Test Content", "author": "John"}}
+        article_data = {"title": "Test Article", "content": "Test Content", "author": "John"}
         r = client.post("/dep", json=article_data)
         assert r.status_code == 201
         article_id = r.json()["id"]
@@ -150,13 +146,13 @@ def test_viewset_custom_curd_depends(api, view_classes: list[type]):
         assert r.json()["title"] == "Test Article"
 
         # Test Update
-        updated_data = {"data": {"title": "Updated Article", "content": "Updated Content", "author": "John"}}
+        updated_data = {"title": "Updated Article", "content": "Updated Content", "author": "John"}
         r = client.put(f"/dep/{article_id}", json=updated_data)
         assert r.status_code == 200
         assert r.json()["title"] == "Updated Article"
 
         # Test Partial Update
-        partial_data = {"data": {"title": "Partially Updated"}}
+        partial_data = {"title": "Partially Updated"}
         r = client.patch(f"/dep/{article_id}", json=partial_data)
         assert r.status_code == 200
         assert r.json()["title"] == "Partially Updated"
