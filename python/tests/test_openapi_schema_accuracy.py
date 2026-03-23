@@ -140,6 +140,7 @@ def test_int_multiple_of_constraint():
 
 def test_unconstrained_int_has_no_constraint_fields():
     """Test that an unconstrained int produces no constraint fields."""
+
     class SimpleQuery(msgspec.Struct):
         page: int = 1
 
@@ -166,6 +167,7 @@ def test_str_pattern_constraint():
 
 def test_str_enum_produces_string_enum_schema():
     """Test that an annotated str with an enum constraint produces the correct schema."""
+
     class FilterQuery(msgspec.Struct):
         status: RegularEnum | None = None
 
@@ -176,6 +178,7 @@ def test_str_enum_produces_string_enum_schema():
 
 def test_int_enum_produces_integer_enum_schema():
     """Test that an annotated int with an enum constraint produces the correct schema."""
+
     class FilterQuery(msgspec.Struct):
         priority: IntEnum | None = None
 
@@ -186,6 +189,7 @@ def test_int_enum_produces_integer_enum_schema():
 
 def test_django_text_choices_produces_string_enum():
     """Test that a Django TextChoices enum produces the correct schema."""
+
     class FilterQuery(msgspec.Struct):
         status: DjangoStatus | None = None
 
@@ -196,6 +200,7 @@ def test_django_text_choices_produces_string_enum():
 
 def test_django_integer_choices_produces_integer_enum():
     """Test that a Django IntegerChoices enum produces the correct schema."""
+
     class FilterQuery(msgspec.Struct):
         priority: DjangoPriority | None = None
 
@@ -206,6 +211,7 @@ def test_django_integer_choices_produces_integer_enum():
 
 def test_literal_string_query_param():
     """Test that a literal string query param produces the correct schema."""
+
     class SortQuery(msgspec.Struct):
         order: Literal["asc", "desc"] = "asc"
 
@@ -216,6 +222,7 @@ def test_literal_string_query_param():
 
 def test_literal_integers_produces_integer_type():
     """Test that a literal integer query param produces the correct schema."""
+
     class PageQuery(msgspec.Struct):
         size: Literal[10, 25, 50, 100] = 10
 
@@ -259,6 +266,7 @@ def test_response_struct_required_fields_have_no_default():
 
 def test_response_struct_reference_field_with_default_none():
     """Test that a reference field with a default of None produces the correct schema."""
+
     class Inner(msgspec.Struct):
         value: str
 

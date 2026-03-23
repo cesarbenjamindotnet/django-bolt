@@ -365,7 +365,9 @@ class TestClient(httpx.Client):
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
         dispatch_sync = getattr(api, "_dispatch_sync", None)
-        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync)
+        self.app_id = _core.create_test_app(
+            api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync
+        )
 
         # Validate mount collisions to mirror production startup behavior.
         self._validate_asgi_mount_conflicts(api)
@@ -420,9 +422,7 @@ class TestClient(httpx.Client):
             return super().__enter__()
         except BaseException:
             if hasattr(self, "_lifespan_cm"):
-                self._lifespan_loop.run_until_complete(
-                    self._lifespan_cm.__aexit__(None, None, None)
-                )
+                self._lifespan_loop.run_until_complete(self._lifespan_cm.__aexit__(None, None, None))
                 self._lifespan_loop.close()
             raise
 
@@ -430,9 +430,7 @@ class TestClient(httpx.Client):
         """Exit context manager — runs lifespan shutdown, then cleans up test app."""
         try:
             if hasattr(self, "_lifespan_cm"):
-                self._lifespan_loop.run_until_complete(
-                    self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb)
-                )
+                self._lifespan_loop.run_until_complete(self._lifespan_cm.__aexit__(exc_type, exc_val, exc_tb))
                 self._lifespan_loop.close()
         finally:
             with contextlib.suppress(builtins.BaseException):
@@ -620,7 +618,9 @@ class AsyncTestClient(httpx.AsyncClient):
         trailing_slash = getattr(api, "trailing_slash", "strip")
         debug = getattr(settings, "DEBUG", False) if settings else False
         dispatch_sync = getattr(api, "_dispatch_sync", None)
-        self.app_id = _core.create_test_app(api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync)
+        self.app_id = _core.create_test_app(
+            api._dispatch, debug, cors_config, trailing_slash, static_config, dispatch_sync
+        )
 
         # Validate mount collisions to mirror production startup behavior.
         TestClient._validate_asgi_mount_conflicts(api)

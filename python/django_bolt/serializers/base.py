@@ -279,9 +279,7 @@ def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelatio
     if getattr(field, "auto_created", False) and not getattr(field, "concrete", True):
         if getattr(field, "one_to_one", False):
             reverse_field = getattr(field, "field", None)
-            reverse_query_attname = (
-                getattr(reverse_field, "attname", None) or getattr(reverse_field, "name", None)
-            )
+            reverse_query_attname = getattr(reverse_field, "attname", None) or getattr(reverse_field, "name", None)
             info = _DjangoRelationInfo(
                 name=attr_name,
                 kind="reverse_one",
@@ -1327,7 +1325,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
 
             if relation is not None:
-                if is_last and nested_output is None and relation.kind == "forward_one" and relation.attname is not None:
+                if (
+                    is_last
+                    and nested_output is None
+                    and relation.kind == "forward_one"
+                    and relation.attname is not None
+                ):
                     return getattr(current, relation.attname, None)
 
                 loaded_value = cls._get_loaded_relation_sync(current, relation)
@@ -1376,7 +1379,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             relation = _get_django_relation_info(current.__class__, part) if isinstance(current, DjangoModel) else None
 
             if relation is not None:
-                if is_last and nested_output is None and relation.kind == "forward_one" and relation.attname is not None:
+                if (
+                    is_last
+                    and nested_output is None
+                    and relation.kind == "forward_one"
+                    and relation.attname is not None
+                ):
                     return getattr(current, relation.attname, None)
 
                 loaded_value = cls._get_loaded_relation_sync(current, relation)

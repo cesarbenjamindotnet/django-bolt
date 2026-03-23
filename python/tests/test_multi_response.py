@@ -124,9 +124,7 @@ async def test_bare_dict_uses_default_status_code():
 
     assert meta["default_status_code"] == 200
 
-    status, _resp_meta, _kind, body = await serialize_response(
-        {"id": 1, "name": "Test"}, meta
-    )
+    status, _resp_meta, _kind, body = await serialize_response({"id": 1, "name": "Test"}, meta)
     assert status == 200
     decoded = msgspec.json.decode(body)
     assert decoded == {"id": 1, "name": "Test"}
@@ -508,9 +506,7 @@ def test_bare_list_multi_response_sync():
     _method, _path, handler_id, _handler = api._routes[0]
     meta = api._handler_meta[handler_id]
 
-    status, _resp_meta, _kind, body = serialize_response_sync(
-        [{"id": 1, "name": "Alice"}], meta
-    )
+    status, _resp_meta, _kind, body = serialize_response_sync([{"id": 1, "name": "Alice"}], meta)
     assert status == 200
     decoded = msgspec.json.decode(body)
     assert decoded == [{"id": 1, "name": "Alice"}]

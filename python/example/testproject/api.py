@@ -59,12 +59,15 @@ api = BoltAPI(
         enabled=True,
     ),
 )
+
+
 @api.get("/", tags=["root"], summary="summary", description="description")
 async def read_root():
     """
     Endpoint that returns a simple "Hello World" dictionary.
     """
     return {"message": "Hello World"}
+
 
 #
 # 2. Custom compression with specific settings:
@@ -385,8 +388,6 @@ async def generate_token(token_req: TokenRequest):
     }
 
 
-
-
 @api.get("/sync", tags=["root"], summary="summary", description="description")
 def read_root_sync():
     """
@@ -403,6 +404,7 @@ async def read_10k():
     """
     return test_data.JSON_10K
 
+
 class ItemSchema(msgspec.Struct):
     id: int
     name: str
@@ -411,7 +413,8 @@ class ItemSchema(msgspec.Struct):
     category: str
     in_stock: bool
     tags: list[str]
-    
+
+
 @api.get("/1k-json", validate_response=False)
 async def read_1k() -> list[ItemSchema]:
     """
@@ -852,7 +855,6 @@ async def stream_plain():
             yield "x"
 
     return StreamingResponse(gen(), media_type="text/plain")
-
 
 
 @api.get("/collected")

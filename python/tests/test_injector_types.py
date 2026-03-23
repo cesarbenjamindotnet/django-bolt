@@ -25,9 +25,7 @@ class TestNoParamsInjector:
 
     def test_no_params_args_is_tuple(self):
         args, kwargs = _NO_PARAMS
-        assert isinstance(args, tuple), (
-            f"_NO_PARAMS args should be a tuple for immutability, got {type(args).__name__}"
-        )
+        assert isinstance(args, tuple), f"_NO_PARAMS args should be a tuple for immutability, got {type(args).__name__}"
 
     def test_no_params_args_is_empty(self):
         args, _ = _NO_PARAMS
@@ -39,9 +37,7 @@ class TestNoParamsInjector:
 
     def test_injector_no_params_returns_tuple_args(self):
         args, kwargs = _injector_no_params(None)
-        assert isinstance(args, tuple), (
-            f"_injector_no_params should return tuple args, got {type(args).__name__}"
-        )
+        assert isinstance(args, tuple), f"_injector_no_params should return tuple args, got {type(args).__name__}"
 
 
 class TestCompiledInjectorTypes:

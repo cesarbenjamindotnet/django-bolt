@@ -358,13 +358,17 @@ def _is_stream_protocol_instance(value: Any) -> bool:
     """Check if a runtime value can be consumed as a stream."""
     if isinstance(value, (str, bytes, bytearray, memoryview, dict, list, tuple, set, frozenset, QuerySet)):
         return False
-    return hasattr(value, "__aiter__") or hasattr(value, "__anext__") or hasattr(value, "__iter__") or hasattr(
-        value, "__next__"
+    return (
+        hasattr(value, "__aiter__")
+        or hasattr(value, "__anext__")
+        or hasattr(value, "__iter__")
+        or hasattr(value, "__next__")
     )
 
 
 def _serialize_stream_chunk_sync(
-    chunk: Any, validator: Any | None,
+    chunk: Any,
+    validator: Any | None,
 ) -> bytes | str | bytearray | memoryview:
     """Serialize one stream chunk for sync generators."""
     if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
@@ -377,7 +381,8 @@ def _serialize_stream_chunk_sync(
 
 
 async def _serialize_stream_chunk_async(
-    chunk: Any, validator: Any | None,
+    chunk: Any,
+    validator: Any | None,
 ) -> bytes | str | bytearray | memoryview:
     """Serialize one stream chunk for async generators."""
     if isinstance(chunk, _RAW_STREAM_CHUNK_TYPES):
@@ -424,7 +429,9 @@ def _build_auto_streaming_response(
     if not is_generator_result and not (is_stream_annotation and _is_stream_protocol_instance(result)):
         return None
 
-    needs_json_chunk_encoding = is_stream_annotation and item_type is not None and item_type not in _RAW_STREAM_CHUNK_TYPES
+    needs_json_chunk_encoding = (
+        is_stream_annotation and item_type is not None and item_type not in _RAW_STREAM_CHUNK_TYPES
+    )
     if needs_json_chunk_encoding:
         is_async_stream = is_async_gen or hasattr(result, "__aiter__")
         content = (
@@ -777,4 +784,3 @@ def serialize_json_data_sync(
     """Serialize dict/list/other data as JSON (sync version)."""
     status = status_code if status_code is not None else meta["default_status_code"]
     return _wire_bytes(status, _RESPONSE_META_JSON, _json.encode(result))
-

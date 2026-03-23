@@ -46,9 +46,7 @@ class AuthorWithRequiredPostsSerializer(Serializer):
 class BlogPostWithCommentsSerializer(Serializer):
     id: int
     title: str
-    comments: list[CommentMiniSerializer] = field(
-        default_factory=list
-    )
+    comments: list[CommentMiniSerializer] = field(default_factory=list)
 
 
 class UserProfileOutputSerializer(Serializer):

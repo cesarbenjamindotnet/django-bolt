@@ -534,8 +534,6 @@ def compile_argument_injector(
     if not fields or pattern is HandlerPattern.NO_PARAMS:
         return _injector_no_params
 
-
-
     # Fast path 3: Path-only parameters (e.g., GET /users/{id})
     # Uses pre-compiled extractors directly on params_map
     if pattern is HandlerPattern.PATH_ONLY:

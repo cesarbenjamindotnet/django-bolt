@@ -412,7 +412,9 @@ class Command(BaseCommand):
         apis = self.autodiscover_apis()
         if not apis:
             self.stdout.write(
-                self.style.WARNING("No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()")
+                self.style.WARNING(
+                    "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()"
+                )
             )
             return
 
@@ -499,7 +501,9 @@ class Command(BaseCommand):
 
         if not apis:
             self.stdout.write(
-                self.style.WARNING("No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment")
+                self.style.WARNING(
+                    "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment"
+                )
             )
             return
 
@@ -644,16 +648,22 @@ class Command(BaseCommand):
 
             def server_fn():
                 _core.start_server(
-                    merged_api._dispatch, options["host"], options["port"],
-                    compression_config, merged_api._dispatch_sync,
+                    merged_api._dispatch,
+                    options["host"],
+                    options["port"],
+                    compression_config,
+                    merged_api._dispatch_sync,
                 )
 
             with contextlib.suppress(KeyboardInterrupt):
                 asyncio.run(serve_with_lifespan(source_lifespans, server_fn))
         else:
             _core.start_server(
-                merged_api._dispatch, options["host"], options["port"],
-                compression_config, merged_api._dispatch_sync,
+                merged_api._dispatch,
+                options["host"],
+                options["port"],
+                compression_config,
+                merged_api._dispatch_sync,
             )
 
     # ------------------------------------------------------------------
@@ -960,11 +970,7 @@ class Command(BaseCommand):
         merged._next_handler_id = next_handler_id
 
         # Collect lifecycle contexts from source APIs
-        merged._source_lifespans = [
-            (api, api._lifespan_context)
-            for _, api in apis
-            if api._has_lifespan
-        ]
+        merged._source_lifespans = [(api, api._lifespan_context) for _, api in apis if api._has_lifespan]
 
         return merged
 

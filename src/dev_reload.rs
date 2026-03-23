@@ -303,10 +303,7 @@ fn run_dev_reloader_inner(
 
         match recv_change(&rx, &filter, debounce, poll_interval) {
             Ok(Some(changed_path)) => {
-                eprintln!(
-                    "[django-bolt] 🔄 Reloading ({})",
-                    changed_path.display()
-                );
+                eprintln!("[django-bolt] 🔄 Reloading ({})", changed_path.display());
                 reload_count += 1;
                 stop_worker(&mut worker)?;
                 worker = Some(spawn_worker(&command, reload_count)?);

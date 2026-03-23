@@ -37,126 +37,194 @@ def _cleanup_modules():
 
 class TestFindBoltApiNames:
     def test_simple_assignment(self, tmp_path):
-        name = _write_module(tmp_path, "_test_simple", """
+        name = _write_module(
+            tmp_path,
+            "_test_simple",
+            """
             from django_bolt.api import BoltAPI
             app = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_canonical_api_name(self, tmp_path):
-        name = _write_module(tmp_path, "_test_canonical", """
+        name = _write_module(
+            tmp_path,
+            "_test_canonical",
+            """
             from django_bolt.api import BoltAPI
             api = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["api"]
 
     def test_ignores_non_bolt_api_from_other_lib(self, tmp_path):
-        name = _write_module(tmp_path, "_test_ignore_other_lib", """
+        name = _write_module(
+            tmp_path,
+            "_test_ignore_other_lib",
+            """
             from some_other_lib import BoltAPI
             api = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []
 
     def test_ignores_attribute_call_from_other_lib(self, tmp_path):
-        name = _write_module(tmp_path, "_test_ignore_other_attr", """
+        name = _write_module(
+            tmp_path,
+            "_test_ignore_other_attr",
+            """
             import some_other_lib.api
             app = some_other_lib.api.BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []
 
     def test_import_alias(self, tmp_path):
-        name = _write_module(tmp_path, "_test_alias", """
+        name = _write_module(
+            tmp_path,
+            "_test_alias",
+            """
             from django_bolt.api import BoltAPI as Bolt
             v1 = Bolt()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["v1"]
 
     def test_attribute_style_call(self, tmp_path):
-        name = _write_module(tmp_path, "_test_attr", """
+        name = _write_module(
+            tmp_path,
+            "_test_attr",
+            """
             import django_bolt.api
             app = django_bolt.api.BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_aliased_module_import(self, tmp_path):
-        name = _write_module(tmp_path, "_test_alias_module", """
+        name = _write_module(
+            tmp_path,
+            "_test_alias_module",
+            """
             import django_bolt.api as bolt
             app = bolt.BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_annotated_assignment(self, tmp_path):
-        name = _write_module(tmp_path, "_test_annassign", """
+        name = _write_module(
+            tmp_path,
+            "_test_annassign",
+            """
             from django_bolt.api import BoltAPI
             app: BoltAPI = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_multiple_instances(self, tmp_path):
-        name = _write_module(tmp_path, "_test_multi", """
+        name = _write_module(
+            tmp_path,
+            "_test_multi",
+            """
             from django_bolt.api import BoltAPI
             v1 = BoltAPI()
             v2 = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["v1", "v2"]
 
     def test_ignores_non_bolt_calls(self, tmp_path):
-        name = _write_module(tmp_path, "_test_ignore", """
+        name = _write_module(
+            tmp_path,
+            "_test_ignore",
+            """
             from django_bolt.api import BoltAPI
             api = BoltAPI()
             other = SomethingElse()
             x = int("5")
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["api"]
 
     def test_ignores_nested_assignment(self, tmp_path):
-        name = _write_module(tmp_path, "_test_nested", """
+        name = _write_module(
+            tmp_path,
+            "_test_nested",
+            """
             from django_bolt.api import BoltAPI
             def create():
                 inner = BoltAPI()
                 return inner
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []
 
     def test_no_bolt_import(self, tmp_path):
-        name = _write_module(tmp_path, "_test_noimport", """
+        name = _write_module(
+            tmp_path,
+            "_test_noimport",
+            """
             x = 42
             y = "hello"
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []
 
     def test_nonexistent_module(self):
         assert find_bolt_api_names("nonexistent_module_xyz_123") == []
 
     def test_syntax_error(self, tmp_path):
-        name = _write_module(tmp_path, "_test_syntax_err", """
+        name = _write_module(
+            tmp_path,
+            "_test_syntax_err",
+            """
             def broken(
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []
 
     def test_multi_target_assignment(self, tmp_path):
-        name = _write_module(tmp_path, "_test_multitarget", """
+        name = _write_module(
+            tmp_path,
+            "_test_multitarget",
+            """
             from django_bolt.api import BoltAPI
             a = b = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["a", "b"]
 
     def test_with_constructor_args(self, tmp_path):
-        name = _write_module(tmp_path, "_test_args", """
+        name = _write_module(
+            tmp_path,
+            "_test_args",
+            """
             from django_bolt.api import BoltAPI
             app = BoltAPI(enable_logging=True, trailing_slash=False)
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_star_import(self, tmp_path):
-        name = _write_module(tmp_path, "_test_star", """
+        name = _write_module(
+            tmp_path,
+            "_test_star",
+            """
             from django_bolt.api import *
             app = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == ["app"]
 
     def test_bare_bolt_api_without_import(self, tmp_path):
-        name = _write_module(tmp_path, "_test_bare", """
+        name = _write_module(
+            tmp_path,
+            "_test_bare",
+            """
             app = BoltAPI()
-        """)
+        """,
+        )
         assert find_bolt_api_names(name) == []

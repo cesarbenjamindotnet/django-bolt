@@ -233,8 +233,8 @@ async def get_mission_log(mission_id: int):
     log = f"""
 === MISSION LOG: {mission.name} ===
 Status: {mission.status.upper()}
-Launch Date: {mission.launch_date or 'TBD'}
-Description: {mission.description or 'No description'}
+Launch Date: {mission.launch_date or "TBD"}
+Description: {mission.description or "No description"}
 ================================
     """.strip()
 

@@ -349,7 +349,12 @@ class TestAsyncSerializationWithCookies:
         """Test that JSON async serialization includes raw cookie tuples for Rust."""
         from django_bolt.serialization import compile_response_handlers, serialize_response
 
-        meta = {"response_type": None, "validate_response": False, "default_status_code": 200, "_stream_info": (False, None)}
+        meta = {
+            "response_type": None,
+            "validate_response": False,
+            "default_status_code": 200,
+            "_stream_info": (False, None),
+        }
         compile_response_handlers(meta)
         response = JSON({"ok": True}).set_cookie("api_token", "secret123", httponly=True)
         status, meta_out, body_kind, body = await serialize_response(response, meta)
@@ -368,7 +373,12 @@ class TestAsyncSerializationWithCookies:
         """Test that Response async serialization includes raw cookie tuples for Rust."""
         from django_bolt.serialization import compile_response_handlers, serialize_response
 
-        meta = {"response_type": None, "validate_response": False, "default_status_code": 200, "_stream_info": (False, None)}
+        meta = {
+            "response_type": None,
+            "validate_response": False,
+            "default_status_code": 200,
+            "_stream_info": (False, None),
+        }
         compile_response_handlers(meta)
         response = Response({"status": "logged_in"}).set_cookie("session", "xyz", secure=True)
         status, meta_out, body_kind, body = await serialize_response(response, meta)
