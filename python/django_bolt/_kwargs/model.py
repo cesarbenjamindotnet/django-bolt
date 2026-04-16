@@ -15,8 +15,6 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
-from .extractors import create_extractor_for_field
-from .runtime import extract_parameter_value, extract_path_params
 from ..dependencies import resolve_dependency
 from ..params import Depends as DependsMarker
 from ..params import Param
@@ -29,6 +27,8 @@ from ..typing import (
     unwrap_optional,
 )
 from ..websocket import WebSocket as WebSocketType
+from .extractors import create_extractor_for_field
+from .runtime import extract_parameter_value, extract_path_params
 
 
 def extract_response_metadata(response_type: Any) -> dict[str, Any]:

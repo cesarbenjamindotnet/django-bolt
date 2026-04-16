@@ -459,8 +459,29 @@ async def test_get_object_without_request_raises_clear_error():
 
     view = ArticleViewSet()
 
-    with pytest.raises(ValueError, match="request object not available"):
+    with pytest.raises(LookupError):
         await view.get_object()
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_get_object_reads_request_from_context_var():
+    from django_bolt._view_context import _current_request
+
+    article = await Article.objects.acreate(title="Keyword Lookup", content="Content", author="Author 1")
+
+    class ArticleViewSet(ViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    class MockRequest:
+        params = {"pk": article.pk}
+
+    _current_request.set(MockRequest())
+    view = ArticleViewSet()
+    resolved = await view.get_object()
+
+    assert resolved.pk == article.pk
 
 
 @pytest.mark.parametrize(

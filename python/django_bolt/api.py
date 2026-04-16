@@ -11,8 +11,6 @@ from contextlib import suppress
 from functools import partial
 from typing import Any, get_origin, get_type_hints
 
-from .request import is_request
-
 # Django import - may fail if Django not configured
 try:
     from django.conf import settings as django_settings
@@ -33,6 +31,7 @@ from ._kwargs import (
     compile_websocket_binder,
     extract_response_metadata,
 )
+from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .admin.static_routes import StaticRouteRegistrar
 from .analysis import analyze_handler, warn_blocking_handler
@@ -881,14 +880,14 @@ class BoltAPI:
         Usage:
             @api.viewset("/users")
             class UserViewSet(ViewSet):
-                async def list(self) -> list[User]:
+                async def list(self, request) -> list[User]:
                     return User.objects.all()[:100]
 
-                async def retrieve(self, id: int) -> User:
+                async def retrieve(self, request, id: int) -> User:
                     return await User.objects.aget(id=id)
 
                 @action(methods=["POST"], detail=True)
-                async def activate(self, id: int):
+                async def activate(self, request, id: int):
                     user = await User.objects.aget(id=id)
                     user.is_active = True
                     await user.asave()
@@ -1034,13 +1033,11 @@ class BoltAPI:
         """
         Best-effort serializer inference for unannotated viewset actions.
 
-        This keeps registration resilient when a viewset overrides
-        `get_serializer_class()` as an instance method and depends on
-        `self.action` at runtime.
+        Called at registration time (no request context), so ``self.action``
+        is unavailable. We pass *action_name* explicitly instead.
         """
         try:
             view_instance = viewset_cls()
-            view_instance.action = action_name
             return view_instance.get_serializer_class(action_name)
         except (AttributeError, TypeError, ValueError):
             return _RESPONSE_MODEL_UNSET
@@ -1109,43 +1106,34 @@ class BoltAPI:
 
                 # Register route for each HTTP method
                 for http_method in attr.methods:
-                    # Create a wrapper that calls the method as an instance method
+                    # Create a wrapper that instantiates the view per request,
+                    # sets the ContextVar-based request/action, and forwards.
                     is_async_method = inspect.iscoroutinefunction(unbound_fn)
                     if is_async_method:
                         async def custom_action_handler(
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
-                            __action_name=name,
+                            _action=name,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
+                            _current_action.set(_action)
+                            _current_request.set(args[0])
                             view_instance = __view_cls()
-                            if hasattr(view_instance, "action"):
-                                view_instance.action = __action_name
-                            if args and is_request(args[0]):
-                                view_instance.request = args[0]
-                            elif "request" in kwargs:
-                                view_instance.request = kwargs["request"]
-
                             return await __unbound_fn(view_instance, *args, **kwargs)
                     else:
                         def custom_action_handler(
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
-                            __action_name=name,
+                            _action=name,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
+                            _current_action.set(_action)
+                            _current_request.set(args[0])
                             view_instance = __view_cls()
-                            if hasattr(view_instance, "action"):
-                                view_instance.action = __action_name
-                            if args and is_request(args[0]):
-                                view_instance.request = args[0]
-                            elif "request" in kwargs:
-                                view_instance.request = kwargs["request"]
-
                             return __unbound_fn(view_instance, *args, **kwargs)
 
                     # Preserve signature and annotations from original method

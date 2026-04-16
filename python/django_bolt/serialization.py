@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
 import msgspec
 from asgiref.sync import sync_to_async
-from django.db.models import Model, QuerySet
+from django.db.models import QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 

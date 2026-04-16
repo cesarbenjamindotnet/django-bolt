@@ -187,7 +187,7 @@ async def retrieve(self, request):
     return ArticleSchema.from_model(article)
 ```
 
-By default, `get_object()` reads the current lookup value from `request.params`.
+By default, `get_object()` reads the current lookup value from `self.request.params`.
 If you need to resolve an object manually, explicit lookups still work:
 
 ```python

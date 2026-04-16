@@ -239,7 +239,7 @@ def test_viewset_action_inheritance(api, view_set_class: type):
 
         @action(["GET"], detail=True)
         async def shared_detail_action(self, request):
-            return {"message": f"detail from base {self.request.params['pk']}"}
+            return {"message": f"detail from base {request.params['pk']}"}
 
     @api.viewset("/inherited")
     class ChildViewSet(BaseViewSet):
@@ -298,7 +298,7 @@ def test_viewset_get_object_accepts_explicit_lookup_values(api):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_viewset_registration_supports_instance_serializer_selection(api):
+def test_viewset_registration_supports_explicit_action_serializer_selection(api):
     article = Article.objects.create(title="List Title", content="Detail Content", author="Author 1")
 
     class ArticleListSchema(Serializer):
@@ -310,8 +310,6 @@ def test_viewset_registration_supports_instance_serializer_selection(api):
         queryset = Article.objects.all()
 
         def get_serializer_class(self, action: str | None = None):
-            if action is None:
-                action = self.action
             return ArticleListSchema if action == "list" else ArticleSchema
 
         async def list(self, request):
@@ -334,6 +332,16 @@ def test_viewset_registration_supports_instance_serializer_selection(api):
         response = client.get(f"/articles/{article.id}")
         assert response.status_code == 200
         assert response.json()["content"] == "Detail Content"
+
+
+def test_viewset_context_access_outside_request_raises():
+    view = ViewSet()
+
+    with pytest.raises(LookupError):
+        _ = view.request
+
+    with pytest.raises(LookupError):
+        _ = view.action
 
 
 @pytest.mark.django_db(transaction=True)
