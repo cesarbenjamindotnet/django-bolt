@@ -270,3 +270,85 @@ def test_viewset_action_inheritance(api, view_set_class: type):
         response = client.get("/inherited/child_action")
         assert response.status_code == 200
         assert response.json() == {"message": "from child"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_viewset_get_object_accepts_explicit_lookup_values(api):
+    article = Article.objects.create(title="Lookup Title", content="Lookup Content", author="Author 1")
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+        lookup_field = "id"
+
+        async def retrieve(self, request, id: int) -> ArticleSchema:
+            if request.query.get("mode") == "keyword":
+                return await self.get_object(id=id)
+            return await self.get_object(id)
+
+    with TestClient(api) as client:
+        response = client.get(f"/articles/{article.id}")
+        assert response.status_code == 200
+        assert response.json()["title"] == "Lookup Title"
+
+        response = client.get(f"/articles/{article.id}?mode=keyword")
+        assert response.status_code == 200
+        assert response.json()["title"] == "Lookup Title"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_viewset_registration_supports_instance_serializer_selection(api):
+    article = Article.objects.create(title="List Title", content="Detail Content", author="Author 1")
+
+    class ArticleListSchema(Serializer):
+        id: int
+        title: str
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ViewSet):
+        queryset = Article.objects.all()
+
+        def get_serializer_class(self, action: str | None = None):
+            if action is None:
+                action = self.action
+            return ArticleListSchema if action == "list" else ArticleSchema
+
+        async def list(self, request):
+            return [{"id": article.id, "title": article.title}]
+
+        async def retrieve(self, request):
+            return {
+                "id": article.id,
+                "title": article.title,
+                "content": article.content,
+                "author": article.author,
+                "is_published": article.is_published,
+            }
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+        assert response.status_code == 200
+        assert response.json() == [{"id": article.id, "title": article.title}]
+
+        response = client.get(f"/articles/{article.id}")
+        assert response.status_code == 200
+        assert response.json()["content"] == "Detail Content"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_viewset_inherits_parent_queryset(api):
+    Article.objects.create(title="Inherited Title", content="Inherited Content", author="Author 1")
+
+    class BaseArticleViewSet(ReadOnlyModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    @api.viewset("/articles")
+    class ArticleViewSet(BaseArticleViewSet):
+        pass
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+        assert response.status_code == 200
+        assert response.json()[0]["title"] == "Inherited Title"

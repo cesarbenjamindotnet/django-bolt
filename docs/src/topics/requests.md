@@ -73,6 +73,19 @@ Type conversion happens automatically:
 
 Invalid conversions return a 422 Unprocessable Entity.
 
+Path parameters are also available on the request object itself:
+
+```python
+from django_bolt import Request
+
+@api.get("/users/{user_id}")
+async def get_user(request: Request):
+    return {"user_id": request.params["user_id"]}
+```
+
+This is especially handy inside `ViewSet` helpers such as `get_object()`, which
+use `request.params` by default.
+
 ## Query parameters
 
 Parameters without path placeholders become query parameters:

@@ -6,7 +6,6 @@ import dis
 import inspect
 import sys
 import threading
-import types
 from collections.abc import Callable
 from contextlib import suppress
 from functools import partial
@@ -980,12 +979,18 @@ class BoltAPI:
                     type_hints = get_type_hints(handler, globalns=globalns, include_extras=True)
                     method_response_model = type_hints.get("return", _RESPONSE_MODEL_UNSET)
 
-                # Fallback to viewset's serializer class if type hints don't provide a response model
+                # Fallback to the viewset's serializer class when possible, but
+                # don't let dynamic runtime selection crash registration.
                 if method_response_model is _RESPONSE_MODEL_UNSET:
-                    if action_name == "list":
-                        method_response_model = list[viewset_cls.get_serializer_class(action_name)]
-                    elif action_name != "destroy":
-                        method_response_model = viewset_cls.get_serializer_class("retrieve")
+                    inferred_serializer = self._infer_viewset_serializer_class(
+                        viewset_cls,
+                        action_name if action_name == "list" else "retrieve",
+                    )
+                    if inferred_serializer is not _RESPONSE_MODEL_UNSET:
+                        if action_name == "list":
+                            method_response_model = list[inferred_serializer]
+                        elif action_name != "destroy":
+                            method_response_model = inferred_serializer
 
                 merged_validate_response = validate_response
                 if merged_validate_response is None:
@@ -1024,6 +1029,21 @@ class BoltAPI:
             return viewset_cls
 
         return decorator
+
+    def _infer_viewset_serializer_class(self, viewset_cls: type[ViewSet], action_name: str):
+        """
+        Best-effort serializer inference for unannotated viewset actions.
+
+        This keeps registration resilient when a viewset overrides
+        `get_serializer_class()` as an instance method and depends on
+        `self.action` at runtime.
+        """
+        try:
+            view_instance = viewset_cls()
+            view_instance.action = action_name
+            return view_instance.get_serializer_class(action_name)
+        except (AttributeError, TypeError, ValueError):
+            return _RESPONSE_MODEL_UNSET
 
     def _register_custom_actions(self, view_cls: type, base_path: str | None, lookup_field: str | None):
         """
@@ -1092,29 +1112,41 @@ class BoltAPI:
                     # Create a wrapper that calls the method as an instance method
                     is_async_method = inspect.iscoroutinefunction(unbound_fn)
                     if is_async_method:
-                        async def custom_action_handler(*args, __unbound_fn=unbound_fn, __view_cls=view_cls, **kwargs):
+                        async def custom_action_handler(
+                            *args,
+                            __unbound_fn=unbound_fn,
+                            __view_cls=view_cls,
+                            __action_name=name,
+                            **kwargs,
+                        ):
                             """Wrapper for custom action method."""
                             view_instance = __view_cls()
-                            # Bind the unbound method to the view instance
-                            bound_method = types.MethodType(__unbound_fn, view_instance)
+                            if hasattr(view_instance, "action"):
+                                view_instance.action = __action_name
                             if args and is_request(args[0]):
                                 view_instance.request = args[0]
                             elif "request" in kwargs:
                                 view_instance.request = kwargs["request"]
 
-                            return await bound_method(*args, **kwargs)
+                            return await __unbound_fn(view_instance, *args, **kwargs)
                     else:
-                        def custom_action_handler(*args, __unbound_fn=unbound_fn, __view_cls=view_cls, **kwargs):
+                        def custom_action_handler(
+                            *args,
+                            __unbound_fn=unbound_fn,
+                            __view_cls=view_cls,
+                            __action_name=name,
+                            **kwargs,
+                        ):
                             """Wrapper for custom action method."""
                             view_instance = __view_cls()
-                            # Bind the unbound method to the view instance
-                            bound_method = types.MethodType(__unbound_fn, view_instance)
+                            if hasattr(view_instance, "action"):
+                                view_instance.action = __action_name
                             if args and is_request(args[0]):
                                 view_instance.request = args[0]
                             elif "request" in kwargs:
                                 view_instance.request = kwargs["request"]
 
-                            return bound_method(*args, **kwargs)
+                            return __unbound_fn(view_instance, *args, **kwargs)
 
                     # Preserve signature and annotations from original method
                     sig = inspect.signature(unbound_fn)

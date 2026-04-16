@@ -108,11 +108,15 @@ from django_bolt.views import ViewSet
 @api.viewset("/articles")
 class ArticleViewSet(ViewSet):
     queryset = Article.objects.all()
+    pagination_class = ArticlePagination
 
-    @paginate(ArticlePagination)
     async def list(self, request) -> list[ArticleSerializer]:
         return await self.get_queryset()
 ```
+
+`pagination_class` is applied automatically to `list()` on `ViewSet`,
+`ReadOnlyModelViewSet`, and `ModelViewSet`. Keep using `@paginate(...)` for
+function-based views or when you want a method-specific override.
 
 ## ModelViewSet with Pagination
 
