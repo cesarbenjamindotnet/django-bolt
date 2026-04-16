@@ -133,6 +133,10 @@ This creates:
 | PATCH | `/items/{pk}` | `partial_update` |
 | DELETE | `/items/{pk}` | `destroy` |
 
+Set `pagination_class` on a `ViewSet`, `ReadOnlyModelViewSet`, or `ModelViewSet`
+to have the `list()` action paginated automatically. Use `@paginate(...)` when
+you want per-method control instead.
+
 ## ModelViewSet
 
 `ModelViewSet` provides built-in Django ORM integration:
@@ -183,6 +187,14 @@ async def retrieve(self, request):
     return ArticleSchema.from_model(article)
 ```
 
+By default, `get_object()` reads the current lookup value from `request.params`.
+If you need to resolve an object manually, explicit lookups still work:
+
+```python
+article = await self.get_object(pk)
+article = await self.get_object(id=id)
+```
+
 ### Custom lookup field
 
 Use a different field for lookups:
@@ -209,7 +221,9 @@ class ArticleViewSet(ModelViewSet):
 
 !!! warning
 
-    If there is no available `serializer_class` or return type annotation for `list` / `retrieve` / `create` / `update` / `partial_update`, a `ValueError` will be raised.
+    Automatic response-model inference needs either a return type annotation or
+    an available serializer class. Default CRUD helpers still require the
+    corresponding serializer class when they validate request data.
 
 ## Custom actions
 
@@ -235,10 +249,10 @@ class ArticleViewSet(ViewSet):
     @action(methods=["POST"], detail=True)
     async def publish(self, request, pk: int):
         """Instance action: POST /articles/{pk}/publish"""
-        article = await self.get_object(pk)
+        article = await self.get_object()
         article.is_published = True
         await article.asave()
-        return {"published": True, "article_id": pk}
+        return {"published": True, "article_id": article.id}
 ```
 
 ### Action parameters
@@ -290,7 +304,7 @@ class StatusUpdate(msgspec.Struct):
 @action(methods=["POST"], detail=True, path="status")
 async def update_status(self, request, pk: int, data: StatusUpdate):
     """POST /articles/{pk}/status with JSON body"""
-    article = await self.get_object(pk)
+    article = await self.get_object()
     article.is_published = data.is_published
     await article.asave()
     return {"updated": True, "is_published": article.is_published}
@@ -304,13 +318,13 @@ Create separate actions for different HTTP methods on the same path:
 @action(methods=["GET"], detail=True, path="status")
 async def get_status(self, request, pk: int):
     """GET /articles/{pk}/status"""
-    article = await self.get_object(pk)
+    article = await self.get_object()
     return {"is_published": article.is_published}
 
 @action(methods=["POST"], detail=True, path="status")
 async def update_status(self, request, pk: int, data: StatusUpdate):
     """POST /articles/{pk}/status"""
-    article = await self.get_object(pk)
+    article = await self.get_object()
     article.is_published = data.is_published
     await article.asave()
     return {"updated": True}

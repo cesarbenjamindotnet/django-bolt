@@ -206,6 +206,7 @@ Register a ViewSet with automatic CRUD routing (routes only; no built-in CRUD lo
 @api.viewset("/items")
 class ItemViewSet(ViewSet):
     serializer_class = ItemSerializer
+    pagination_class = PageNumberPagination
 
     async def list(self, request):
         return Item.objects.all()
@@ -221,6 +222,13 @@ class ItemViewSet(ModelViewSet):
     create_serializer_class = ItemCreateSerializer
     pagination_class = PageNumberPagination
 ```
+
+Notes:
+
+- `pagination_class` automatically wraps the `list()` action for `ViewSet`,
+  `ReadOnlyModelViewSet`, and `ModelViewSet`.
+- `list_serializer_class`, `create_serializer_class`, and
+  `update_serializer_class` are used automatically by the built-in CRUD helpers.
 
 ### WebSocket decorator
 

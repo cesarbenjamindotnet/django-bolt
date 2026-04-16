@@ -20,7 +20,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from django.db.models import Model, ObjectDoesNotExist, QuerySet
-from django.forms.models import model_to_dict
 
 from ._json import decode
 from .exceptions import HTTPException
@@ -261,16 +260,14 @@ class ViewSet[T: Model](APIView):
         """
         Hook called when a subclass is created.
 
-        Converts class-level queryset to instance-level _base_queryset
-        to enable proper cloning on each access (Litestar pattern).
+        Capture an explicitly declared class-level queryset once so runtime
+        lookup can stay simple and avoid descriptor/MRO fallbacks.
         """
         super().__init_subclass__(**kwargs)
 
-        # If subclass defines queryset as class attribute, store it separately
-        if "queryset" in cls.__dict__ and cls.__dict__["queryset"] is not None:
-            # Store the base queryset for cloning
-            cls._base_queryset = cls.__dict__["queryset"]
-            # Remove the class attribute so property works
+        declared_queryset = cls.__dict__.get("queryset")
+        if declared_queryset is not None:
+            cls._base_queryset = declared_queryset
             delattr(cls, "queryset")
 
     def _get_base_queryset(self) -> QuerySet[T]:
@@ -283,12 +280,7 @@ class ViewSet[T: Model](APIView):
         if hasattr(self, "_instance_queryset"):
             return self._instance_queryset
 
-        # Check class attribute (set via __init_subclass__)
-        if hasattr(self.__class__, "_base_queryset"):
-            return self.__class__._base_queryset
-
-        # Check if there's a class attribute 'queryset' (shouldn't happen after __init_subclass__)
-        return getattr(self.__class__, "queryset", None)
+        return getattr(self.__class__, "_base_queryset", None)
 
     def _clone_queryset(self, queryset):
         """
@@ -303,13 +295,8 @@ class ViewSet[T: Model](APIView):
         if queryset is None:
             return None
 
-        # Always return a fresh clone to prevent state leakage
-        # Django QuerySets are lazy, so .all() creates a new QuerySet instance
-        if hasattr(queryset, "_clone"):
-            # Use Django's internal _clone() for true deep copy
-            return queryset._clone()
-        elif hasattr(queryset, "all"):
-            # Fallback to .all() which also creates a new QuerySet
+        # Django QuerySets are lazy, and .all() returns a fresh queryset.
+        if hasattr(queryset, "all") and callable(queryset.all):
             return queryset.all()
 
         # Not a QuerySet, return as-is
@@ -356,7 +343,7 @@ class ViewSet[T: Model](APIView):
         """
         base_qs = self._get_base_queryset()
 
-        if base_qs is None or isinstance(base_qs, property):
+        if base_qs is None:
             raise ValueError(
                 f"'{self.__class__.__name__}' should either include a `queryset` attribute, "
                 f"or override the `get_queryset()` method."
@@ -364,6 +351,17 @@ class ViewSet[T: Model](APIView):
 
         # Return a fresh clone
         return self._clone_queryset(base_qs)
+
+    async def _apply_filter_queryset(self, queryset: QuerySet[T]) -> QuerySet[T]:
+        """
+        Apply filter_queryset() only when a subclass actually overrides it.
+
+        The default implementation is a no-op, so skipping the await saves a
+        small but common hot-path call for unfiltered list/detail routes.
+        """
+        if type(self).filter_queryset is ViewSet.filter_queryset:
+            return queryset
+        return await self.filter_queryset(queryset)
 
     async def filter_queryset(self, queryset: QuerySet[T]) -> QuerySet[T]:
         """
@@ -403,9 +401,13 @@ class ViewSet[T: Model](APIView):
         # Subclasses should override this method to add filtering logic
         return queryset
 
-    async def get_object(self) -> T:
+    async def get_object(self, *args: Any, **lookup_kwargs: Any) -> T:
         """
         Get a single object by lookup field.
+
+        Supports both the newer parameterless form, which reads the lookup
+        value from `request.params`, and the older explicit lookup form such
+        as `get_object(pk)` or `get_object(id=id)`.
 
         Returns:
             Model instance
@@ -414,12 +416,25 @@ class ViewSet[T: Model](APIView):
             HTTPException: If object not found (404)
         """
         queryset = await self.get_queryset()
-        queryset = await self.filter_queryset(queryset)
+        queryset = await self._apply_filter_queryset(queryset)
 
-        if self.lookup_field not in self.request.params:
-            raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
+        if args:
+            if len(args) != 1 or lookup_kwargs:
+                raise TypeError("get_object() accepts either one positional lookup value or keyword lookups")
+            lookup_kwargs = {self.lookup_field: args[0]}
+        elif not lookup_kwargs:
+            request = self.request
+            if request is None:
+                raise ValueError(
+                    f"Cannot resolve lookup for {self.__class__.__name__}: request object not available. "
+                    "Pass an explicit lookup value or ensure the handler received a request parameter."
+                )
 
-        lookup_kwargs = {self.lookup_field: self.request.params[self.lookup_field]}
+            params = getattr(request, "params", None)
+            if params is None or self.lookup_field not in params:
+                raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
+
+            lookup_kwargs = {self.lookup_field: params[self.lookup_field]}
         try:
             # Use aget for async retrieval
             obj = await queryset.aget(**lookup_kwargs)
@@ -429,9 +444,9 @@ class ViewSet[T: Model](APIView):
             raise HTTPException(status_code=404, detail="Not found") from e
 
     @classmethod
-    def get_serializer_class(cls, action: str | None = None) -> type[Serializer]:
+    def _get_default_serializer_class(cls, action: str | None = None) -> type[Serializer]:
         """
-        Get the serializer class for this viewset.
+        Resolve the default serializer class for this viewset.
 
         Supports action-specific serializer classes:
         - list: list_serializer_class or serializer_class
@@ -471,17 +486,47 @@ class ViewSet[T: Model](APIView):
 
         return cls.serializer_class
 
+    def get_serializer_class(self, action: str | None = None) -> type[Serializer]:
+        """
+        Get the serializer class for this viewset.
+
+        Subclasses can override this as an instance method and use runtime state
+        like `self.action`. When not overridden, class-level action-specific
+        serializer attributes provide the default behavior.
+        """
+        if action is None:
+            action = self.action
+        return self.__class__._get_default_serializer_class(action)
+
     async def perform_create(self, obj: T):
         await obj.asave()
 
     async def perform_update(self, obj: T):
         await obj.asave()
 
-    async def perform_destory(self, obj: T):
+    async def perform_destroy(self, obj: T):
         await obj.adelete()
+
+    async def perform_destory(self, obj: T):
+        # Backward-compatible alias for the misspelled hook introduced on this branch.
+        await self.perform_destroy(obj)
+
+    async def _perform_destroy(self, obj: T):
+        # If a subclass only overrides the misspelled hook, keep honoring it so
+        # existing branch consumers don't silently lose their custom behavior.
+        if (
+            type(self).perform_destory is not ViewSet.perform_destory
+            and type(self).perform_destroy is ViewSet.perform_destroy
+        ):
+            await self.perform_destory(obj)
+            return
+
+        await self.perform_destroy(obj)
 
 
 # Mixins for common CRUD operations
+# Runtime mixins inherit from `object` to avoid generic MRO issues, while
+# type checkers still see the full ViewSet API during development.
 if TYPE_CHECKING:
     _ViewSet = ViewSet
 else:
@@ -504,7 +549,7 @@ class ListMixin(_ViewSet):
         consider setting pagination_class or filtering via filter_queryset().
         """
         queryset = await self.get_queryset()
-        queryset = await self.filter_queryset(queryset)
+        queryset = await self._apply_filter_queryset(queryset)
         return queryset
 
 
@@ -537,17 +582,15 @@ class CreateMixin(_ViewSet):
         The `data` parameter should be a msgspec.Struct with the fields to create.
         Uses create_serializer_class if defined, otherwise serializer_class.
         """
-        data = decode(request.body)
-
-        # Use serializer validate data
         serializer_class = self.get_serializer_class("create")
-        validated_obj = serializer_class.model_validate(data)
+        validated_obj = serializer_class.model_validate_json(request.body)
 
         # Get the model class
-        model = (await self.get_queryset()).model
+        base_queryset = self._get_base_queryset()
+        model = base_queryset.model if base_queryset is not None else (await self.get_queryset()).model
 
         # Create object
-        obj = model(**validated_obj.to_dict())
+        obj = validated_obj.to_model(model)
         await self.perform_create(obj)
 
         return obj
@@ -563,16 +606,17 @@ class UpdateMixin(_ViewSet):
 
     async def update(self, request: Request):
         """Update an object (full update)."""
-        data = decode(request.body)
         obj = await self.get_object()
 
-        # Use serializer validate data
         serializer_class = self.get_serializer_class("update")
-        validated_obj = serializer_class.model_validate(data)
+        validated_obj = serializer_class.model_validate_json(request.body)
 
         # Update object fields
-        for key, value in validated_obj.to_dict().items():
-            setattr(obj, key, value)
+        if validated_obj.__struct_config__.omit_defaults:
+            for key, value in validated_obj.to_dict().items():
+                setattr(obj, key, value)
+        else:
+            validated_obj.update_instance(obj)
 
         # Save object
         await self.perform_update(obj)
@@ -593,18 +637,28 @@ class PartialUpdateMixin(_ViewSet):
         data = decode(request.body)
         obj = await self.get_object()
 
-        # Extract only fields that exist in the serializer's struct_fields from the incoming data
         serializer_class = self.get_serializer_class("update")
-        patch_data = {field: data[field] for field in serializer_class.__struct_fields__ if field in data}
+        rename_map = getattr(serializer_class, "__rename_map__", {})
+        input_key_to_field = {field_name: field_name for field_name in serializer_class.__struct_fields__}
+        input_key_to_field.update({alias: field_name for field_name, alias in rename_map.items()})
 
-        # Patch object fields
-        for key, value in patch_data.items():
-            setattr(obj, key, value)
+        patch_data = {}
+        for key, value in data.items():
+            field_name = input_key_to_field.get(key)
+            if field_name is not None:
+                patch_data[field_name] = value
 
-        obj_dict = model_to_dict(obj)
+        if not patch_data:
+            return obj
 
-        # Use serializer validate data
-        serializer_class.model_validate(obj_dict)
+        current_state = await serializer_class.afrom_model(obj)
+        merged_data = current_state.to_dict()
+        merged_data.update(patch_data)
+        validated_obj = serializer_class.model_validate(merged_data)
+
+        # Apply only the patched fields, but use the validated values.
+        for field_name in patch_data:
+            setattr(obj, field_name, getattr(validated_obj, field_name))
 
         # Save object
         await self.perform_update(obj)
@@ -625,7 +679,7 @@ class DestroyMixin(_ViewSet):
         obj = await self.get_object()
 
         # Delete object
-        await self.perform_destory(obj)
+        await self._perform_destroy(obj)
 
         # Return 204 response
         return None

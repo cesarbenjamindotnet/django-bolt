@@ -45,6 +45,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+_PAGINATION_UNSET = object()
 
 
 class PaginatedResponse[T](msgspec.Struct, omit_defaults=True):
@@ -229,10 +230,23 @@ class PaginationBase(ABC):
 
         # Bolt Serializer - use from_model + dump_many for efficiency
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):
-            serializer_instances = list(
-                await asyncio.gather(*(self.serializer_class.afrom_model(item) for item in items))
+            serializer_class = self.serializer_class
+            serializer_class._ensure_from_model_ready()
+            can_use_sync_from_model = not any(
+                spec.nested is not None or (spec.source is not None and "." in spec.source)
+                for spec in serializer_class.__model_field_specs__
             )
-            return self.serializer_class.dump_many(serializer_instances)
+
+            if can_use_sync_from_model:
+                try:
+                    serializer_instances = [serializer_class.from_model(item) for item in items]
+                except Exception:
+                    serializer_instances = None
+                else:
+                    return serializer_class.dump_many(serializer_instances)
+
+            serializer_instances = list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
+            return serializer_class.dump_many(serializer_instances)
 
         # Plain msgspec.Struct - extract fields from model instances
         if hasattr(self.serializer_class, "__struct_fields__"):
@@ -677,46 +691,20 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
-        # Create pagination instance
-        paginator = pagination_class()
-
         # Store original handler for introspection
         original_handler = handler
+        request_getter = _compile_request_getter(original_handler)
+        cached_paginator: PaginationBase | None = None
 
         @wraps(handler)
         async def wrapper(*args, **kwargs):
-            # Get serializer class set by route decorator (if any)
-            # This enables efficient batch serialization via Serializer.dump_many()
-            serializer_class = getattr(wrapper, "__serializer_class__", None)
-            paginator.serializer_class = serializer_class
+            nonlocal cached_paginator
 
-            # Extract request from args/kwargs
-            # Request can be in:
-            # 1. kwargs['request'] - most common
-            # 2. args[0] - for single-param handlers
-            # 3. args[1] - for ViewSet methods (args[0] is self)
-            request = None
+            if cached_paginator is None:
+                cached_paginator = pagination_class()
+                cached_paginator.serializer_class = getattr(wrapper, "__serializer_class__", None)
 
-            # Try kwargs first (most reliable)
-            if "request" in kwargs:
-                request = kwargs["request"]
-            # Check if this is a method with self as first arg
-            elif len(args) >= 2:
-                # Could be (self, request, ...) or (request, other_params...)
-                # If args[0] looks like a view instance, args[1] is request
-                first_arg = args[0]
-                if (
-                    hasattr(first_arg, "__class__")
-                    and hasattr(first_arg.__class__, "__mro__")
-                    and any("View" in cls.__name__ for cls in first_arg.__class__.__mro__)
-                ):
-                    request = args[1]
-                else:
-                    # args[0] is request, args[1] is another parameter
-                    request = args[0]
-            elif len(args) == 1:
-                # Single arg - should be request
-                request = args[0]
+            request = request_getter(args, kwargs)
 
             if request is None:
                 raise ValueError(
@@ -725,7 +713,7 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
                 )
 
             # PyRequest already supports .get() and __getitem__, no need to copy
-            if isinstance(request, dict) or hasattr(request, "__getitem__"):
+            if isinstance(request, dict) or hasattr(request, "get") or hasattr(request, "__getitem__"):
                 request_dict = request
             else:
                 raise ValueError(
@@ -738,7 +726,7 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
             queryset = await handler(*args, **kwargs)
 
             # Apply pagination using dict version
-            paginated = await paginator.paginate_queryset(queryset, request_dict)
+            paginated = await cached_paginator.paginate_queryset(queryset, request_dict)
 
             return paginated
 
@@ -755,3 +743,33 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
         return wrapper
 
     return decorator
+
+
+def _compile_request_getter(handler: Callable) -> Callable[[tuple[Any, ...], dict[str, Any]], Any]:
+    """Compile a lightweight request extractor once per paginated handler."""
+    sig = inspect.signature(handler)
+    positional_request_index: int | None = None
+
+    for index, param in enumerate(sig.parameters.values()):
+        if param.name != "request":
+            continue
+
+        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional_request_index = index
+        break
+
+    def get_request(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        request = kwargs.get("request", _PAGINATION_UNSET)
+        if request is not _PAGINATION_UNSET:
+            return request
+
+        if positional_request_index is not None and positional_request_index < len(args):
+            return args[positional_request_index]
+
+        for candidate in args[:2]:
+            if isinstance(candidate, dict) or hasattr(candidate, "get") or hasattr(candidate, "__getitem__"):
+                return candidate
+
+        return None
+
+    return get_request

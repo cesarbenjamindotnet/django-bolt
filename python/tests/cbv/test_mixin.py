@@ -2,7 +2,7 @@ import pytest
 
 from django_bolt import BoltAPI, ModelViewSet, ViewSet
 from django_bolt.pagination import PageNumberPagination, paginate
-from django_bolt.serializers import Serializer
+from django_bolt.serializers import Serializer, field_validator
 from django_bolt.testing import TestClient
 from django_bolt.views import (
     CreateMixin,
@@ -167,6 +167,30 @@ def test_list_mixin_filtering(api, view_classes: list[type]):
         assert data[0]["title"] == "Title 2"
 
 
+@pytest.mark.django_db(transaction=True)
+def test_default_filter_queryset_is_skipped(api, monkeypatch):
+    """The base no-op filter hook should not be awaited on hot paths."""
+
+    async def fail_filter_queryset(self, queryset):
+        raise AssertionError("default filter_queryset() should be skipped")
+
+    monkeypatch.setattr(ViewSet, "filter_queryset", fail_filter_queryset)
+
+    article = Article.objects.create(title="Title 1", content="Content 1", author="Author 1")
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+        assert response.status_code == 200
+
+        response = client.get(f"/articles/{article.pk}")
+        assert response.status_code == 200
+
+
 @pytest.mark.parametrize(
     "view_classes",
     [
@@ -282,6 +306,43 @@ def test_partial_update_mixin(api, view_classes: list[type]):
 @pytest.mark.parametrize(
     "view_classes",
     [
+        (PartialUpdateMixin, ViewSet),
+        (ModelViewSet,),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_partial_update_mixin_uses_validated_values(api, view_classes: list[type]):
+    article = Article.objects.create(title="Old Title", content="Old Content", author="Author 1")
+
+    class ArticlePatchSchema(Serializer):
+        title: str | None = None
+
+        @field_validator("title")
+        def normalize_title(cls, value: str | None):
+            return value.strip() if value is not None else value
+
+    @api.viewset("/articles")
+    class ArticleViewSet(*view_classes):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+        update_serializer_class = ArticlePatchSchema
+
+    with TestClient(api) as client:
+        response = client.patch(
+            f"/articles/{article.id}",
+            json={"title": "  Patched Title  "},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["title"] == "Patched Title"
+
+        article.refresh_from_db()
+        assert article.title == "Patched Title"
+
+
+@pytest.mark.parametrize(
+    "view_classes",
+    [
         (DestroyMixin, ViewSet),
         (ModelViewSet,),
     ],
@@ -298,6 +359,62 @@ def test_destroy_mixin(api, view_classes: list[type]):
     with TestClient(api) as client:
         response = client.delete(f"/articles/{article.id}")
         assert response.status_code == 204
+        assert not Article.objects.filter(id=article.id).exists()
+
+
+@pytest.mark.parametrize(
+    "view_classes",
+    [
+        (DestroyMixin, ViewSet),
+        (ModelViewSet,),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_destroy_mixin_uses_perform_destroy_hook(api, view_classes: list[type]):
+    article = Article.objects.create(title="To Delete", content="Content", author="Author 1")
+    calls = {"perform_destroy": 0}
+
+    @api.viewset("/articles")
+    class ArticleViewSet(*view_classes):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+        async def perform_destroy(self, obj):
+            calls["perform_destroy"] += 1
+            await super().perform_destroy(obj)
+
+    with TestClient(api) as client:
+        response = client.delete(f"/articles/{article.id}")
+        assert response.status_code == 204
+        assert calls["perform_destroy"] == 1
+        assert not Article.objects.filter(id=article.id).exists()
+
+
+@pytest.mark.parametrize(
+    "view_classes",
+    [
+        (DestroyMixin, ViewSet),
+        (ModelViewSet,),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_destroy_mixin_keeps_legacy_perform_destory_override(api, view_classes: list[type]):
+    article = Article.objects.create(title="To Delete", content="Content", author="Author 1")
+    calls = {"perform_destory": 0}
+
+    @api.viewset("/articles")
+    class ArticleViewSet(*view_classes):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+        async def perform_destory(self, obj):
+            calls["perform_destory"] += 1
+            await super().perform_destory(obj)
+
+    with TestClient(api) as client:
+        response = client.delete(f"/articles/{article.id}")
+        assert response.status_code == 204
+        assert calls["perform_destory"] == 1
         assert not Article.objects.filter(id=article.id).exists()
 
 
@@ -331,6 +448,19 @@ def test_retrieve_by_custom_lookup_field(api, view_classes: list[type]):
         # Try to retrieve by non-existent title
         response = client.get("/articles/nonexistent")
         assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_get_object_without_request_raises_clear_error():
+    class ArticleViewSet(ViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    view = ArticleViewSet()
+
+    with pytest.raises(ValueError, match="request object not available"):
+        await view.get_object()
 
 
 @pytest.mark.parametrize(
