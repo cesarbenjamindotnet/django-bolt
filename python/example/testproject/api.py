@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import AsyncIterable
 from contextlib import asynccontextmanager
 from typing import Annotated, Protocol
 
@@ -29,7 +30,7 @@ from django_bolt.health import add_health_check
 from django_bolt.middleware import no_compress
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Cookie, Depends, File, Form, Header
-from django_bolt.responses import HTML, FileResponse, PlainText, Redirect, StreamingResponse
+from django_bolt.responses import HTML, EventSourceResponse, FileResponse, PlainText, Redirect, ServerSentEvent, StreamingResponse
 from django_bolt.serializers import Serializer, field_validator
 from django_bolt.types import Request
 from django_bolt.views import APIView, ViewSet
@@ -885,6 +886,42 @@ def sse_sync():
             yield f"data: {time.time()}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ==== EventSourceResponse (new SSE syntax) ====
+
+class TimestampEvent(msgspec.Struct):
+    timestamp: float
+    count: int
+
+
+@api.get("/sse-new", response_class=EventSourceResponse)
+async def sse_new() -> AsyncIterable[TimestampEvent]:
+    """Implicit SSE: generator handler + response_class. No @no_compress needed."""
+    count = 0
+    while True:
+        await asyncio.sleep(1)
+        count += 1
+        yield TimestampEvent(timestamp=time.time(), count=count)
+
+
+@api.get("/sse-new-explicit")
+async def sse_new_explicit():
+    """Explicit SSE: return EventSourceResponse with mixed yields."""
+
+    async def gen():
+        yield {"message": "stream started", "time": time.time()}
+        for i in range(5):
+            await asyncio.sleep(1)
+            yield ServerSentEvent(
+                data={"count": i, "time": time.time()},
+                event="tick",
+                id=str(i),
+            )
+        yield ServerSentEvent(comment="stream ending")
+        yield ServerSentEvent(data="done", event="complete")
+
+    return EventSourceResponse(gen())
 
 
 # ==== OpenAI-style Chat Completions (streaming/non-streaming) ====

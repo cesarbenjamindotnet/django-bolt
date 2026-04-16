@@ -219,6 +219,10 @@ class HandlerMetadata(TypedDict, total=False):
     handler_pattern: HandlerPattern
     """Handler pattern for specialized injector selection at registration time."""
 
+    # Response class override (e.g., EventSourceResponse for SSE)
+    response_class: type | None
+    """Optional response class override for the route (e.g., EventSourceResponse)."""
+
 
 # Simple scalar types that map to query parameters
 SIMPLE_TYPES = (str, int, float, bool, bytes)

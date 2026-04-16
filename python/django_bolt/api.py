@@ -484,6 +484,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "GET",
@@ -496,6 +497,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def post(
@@ -510,6 +512,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "POST",
@@ -522,6 +525,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def put(
@@ -536,6 +540,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "PUT",
@@ -548,6 +553,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def patch(
@@ -562,6 +568,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "PATCH",
@@ -574,6 +581,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def delete(
@@ -588,6 +596,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "DELETE",
@@ -600,6 +609,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def head(
@@ -614,6 +624,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "HEAD",
@@ -626,6 +637,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def options(
@@ -640,6 +652,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
     ):
         return self._route_decorator(
             "OPTIONS",
@@ -652,6 +665,7 @@ class BoltAPI:
             tags=tags,
             summary=summary,
             description=description,
+            response_class=response_class,
         )
 
     def websocket(
@@ -1121,6 +1135,7 @@ class BoltAPI:
         tags: list[str] | None = None,
         summary: str | None = None,
         description: str | None = None,
+        response_class: type | None = None,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
     ):
@@ -1256,6 +1271,7 @@ class BoltAPI:
             else:
                 meta["response_type"] = None
             meta["validate_response"] = route_validate_response
+            meta["response_class"] = response_class
             # Pre-compute stream annotation analysis (registration time only)
             meta["_stream_info"] = _extract_stream_item_type(meta["response_type"])
 

@@ -250,149 +250,17 @@ async def async_stream():
 
 ### Server-Sent Events (SSE)
 
-Create SSE endpoints for real-time updates. SSE is a standard for pushing events from server to browser over HTTP.
-
-#### Basic SSE
+For SSE endpoints, see the dedicated [Server-Sent Events guide](sse.md). Django-Bolt provides `EventSourceResponse` with automatic SSE framing, compression skipping, and keep-alive pings:
 
 ```python
-import asyncio
+from collections.abc import AsyncIterable
+from django_bolt.responses import EventSourceResponse
 
-@api.get("/events")
-async def events():
-    async def generate():
-        for i in range(10):
-            yield f"data: message-{i}\n\n"
-            await asyncio.sleep(1)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-#### SSE format
-
-Each event is terminated by a double newline (`\n\n`). Fields:
-
-| Field | Description |
-|-------|-------------|
-| `data:` | Event data (required) |
-| `event:` | Event type (optional, default: "message") |
-| `id:` | Event ID for reconnection (optional) |
-| `retry:` | Reconnection time in ms (optional) |
-
-#### Full SSE event format
-
-```python
-@api.get("/sse-events")
-async def sse_events():
-    async def generate():
-        for i in range(5):
-            # Full SSE event with all fields
-            yield f"event: update\nid: {i}\ndata: {{\"count\": {i}}}\n\n"
-            await asyncio.sleep(0.5)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-Client receives:
-```
-event: update
-id: 0
-data: {"count": 0}
-
-event: update
-id: 1
-data: {"count": 1}
-```
-
-#### Sync generators for SSE
-
-You can use sync generators for CPU-bound operations:
-
-```python
-import time
-
-@api.get("/sync-sse")
-async def sync_sse():
-    def generate():
-        for i in range(5):
-            yield f"data: sync-message-{i}\n\n"
-            time.sleep(0.1)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-#### Mixed data types
-
-Generators can yield both strings and bytes:
-
-```python
-@api.get("/mixed-sse")
-async def mixed_sse():
-    async def generate():
-        yield "data: string message\n\n"
-        yield b"data: bytes message\n\n"  # Also works
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-#### SSE with cleanup
-
-Use try/finally for resource cleanup when clients disconnect:
-
-```python
-@api.get("/sse-with-cleanup")
-async def sse_with_cleanup():
-    async def generate():
-        try:
-            yield "data: START\n\n"
-            for i in range(100):
-                yield f"data: chunk-{i}\n\n"
-                await asyncio.sleep(0.1)
-            yield "data: END\n\n"
-        finally:
-            # This runs when client disconnects
-            print("Client disconnected, cleaning up")
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-#### SSE headers
-
-SSE endpoints should include these headers for proper behavior:
-
-```python
-@api.get("/sse")
-async def sse():
-    async def generate():
-        for i in range(10):
-            yield f"data: {i}\n\n"
-            await asyncio.sleep(1)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Disable nginx buffering
-        }
-    )
-```
-
-### Disabling compression for streams
-
-Streaming responses should not be compressed. Use `@no_compress`:
-
-```python
-from django_bolt.middleware import no_compress
-
-@api.get("/sse")
-@no_compress
-async def sse():
-    async def generate():
-        for i in range(10):
-            yield f"data: {i}\n\n"
-            await asyncio.sleep(1)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+@api.get("/events", response_class=EventSourceResponse)
+async def events() -> AsyncIterable[dict]:
+    for i in range(10):
+        yield {"count": i}
+        await asyncio.sleep(1)
 ```
 
 ## Response with custom headers

@@ -15,7 +15,7 @@ use crate::response_meta::ResponseMeta;
 pub fn build_sse_response(
     status: StatusCode,
     custom_headers: Vec<(String, String)>,
-    skip_compression: bool,
+    _skip_compression: bool,
 ) -> HttpResponseBuilder {
     let mut builder = HttpResponse::build(status);
 
@@ -32,9 +32,9 @@ pub fn build_sse_response(
     builder.insert_header(("Pragma", "no-cache"));
     builder.insert_header(("Expires", "0"));
 
-    if skip_compression {
-        builder.insert_header(("Content-Encoding", "identity"));
-    }
+    // Always skip compression for SSE — buffering defeats streaming.
+    // The compression middleware checks for Content-Encoding: identity and skips.
+    builder.insert_header(("Content-Encoding", "identity"));
 
     builder
 }

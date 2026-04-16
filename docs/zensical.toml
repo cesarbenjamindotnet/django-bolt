@@ -76,6 +76,7 @@ nav = [
     { "Logging" = "topics/logging.md" },
     { "Health Checks" = "topics/health-checks.md" },
     { "Testing" = "topics/testing.md" },
+    { "Server-Sent Events" = "topics/sse.md" },
     { "WebSocket" = "topics/websocket.md" },
     { "OpenAPI" = "topics/openapi.md" },
     { "ASGI Mounts" = "topics/asgi-mounts.md" },

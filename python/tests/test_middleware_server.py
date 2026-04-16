@@ -2,6 +2,7 @@
 Integration test for middleware with TestClient
 """
 
+import anyio
 import time
 
 import django
@@ -96,6 +97,15 @@ def api():
         async def agen():
             for i in range(3):
                 yield f"async-chunk{i},"
+
+        return StreamingResponse(agen(), media_type="text/plain")
+
+    @api.get("/stream-with-task-group")
+    async def stream_with_task_group():
+        async def agen():
+            async with anyio.create_task_group():
+                yield b"inside,"
+            yield b"after,"
 
         return StreamingResponse(agen(), media_type="text/plain")
 
@@ -258,6 +268,13 @@ def test_streaming_with_cors(client):
     assert response.status_code == 200
     assert response.headers.get("content-type", "").startswith("text/plain")
     assert response.content == b"async-chunk0,async-chunk1,async-chunk2,"
+
+
+def test_async_stream_preserves_task_affinity(http_client):
+    """Async streaming should keep context-manager enter/exit on the same Python task."""
+    response = http_client.get("/stream-with-task-group")
+    assert response.status_code == 200
+    assert response.content == b"inside,after,"
 
 
 def test_sse_with_cors(client):

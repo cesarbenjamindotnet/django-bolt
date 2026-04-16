@@ -223,6 +223,27 @@ with TestClient(api) as client:
 
 ## Streaming responses
 
+### SSE with EventSourceResponse
+
+```python
+from django_bolt.responses import EventSourceResponse
+
+@api.get("/sse", response_class=EventSourceResponse)
+async def sse():
+    yield {"message": "hello"}
+    yield {"message": "world"}
+
+with TestClient(api) as client:
+    response = client.get("/sse")
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    body = response.content.decode()
+    assert 'data: {"message":"hello"}' in body
+    assert 'data: {"message":"world"}' in body
+```
+
+### Raw streaming with StreamingResponse
+
 Test streaming with `stream=True`:
 
 ```python
