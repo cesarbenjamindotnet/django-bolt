@@ -17,14 +17,16 @@ Example:
 
 import inspect
 from collections.abc import Callable
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from django.db.models import Model, ObjectDoesNotExist, QuerySet
 
 from ._json import decode
+from ._view_context import _current_action, _current_request
 from .exceptions import HTTPException
 from .pagination import PaginationBase
-from .request import Request, is_request
+from .request import Request
 from .serializers.base import Serializer
 
 
@@ -57,6 +59,10 @@ class APIView:
         for key, value in kwargs.items():
             setattr(self, key, value)
 
+    @property
+    def request(self) -> Request:
+        return _current_request.get()
+
     @classmethod
     def as_view(cls, method: str, action: str | None = None) -> Callable:
         """
@@ -88,7 +94,7 @@ class APIView:
         # DRF-style action mapping: try action name first, then HTTP method
         # Actions: list, retrieve, create, update, partial_update, destroy
         method_handler = None
-        action_name = None
+        action_name = method_lower
 
         if action:
             # Try the action name first (e.g., "list", "retrieve")
@@ -119,10 +125,6 @@ class APIView:
         # This eliminates the per-request instantiation overhead (~40% faster)
         view_instance = cls()
 
-        # Set action name once at registration time
-        if hasattr(view_instance, "action"):
-            view_instance.action = action_name
-
         # Bind the method once to eliminate lookup overhead
         bound_method = method_handler.__get__(view_instance, cls)
 
@@ -131,28 +133,18 @@ class APIView:
 
         if is_async_method:
             # Create async wrapper for async methods
-            async def view_handler(*args, **kwargs):
+            async def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated async view handler that calls bound method directly."""
-                # Inject request object into view instance for pagination/filtering
-                # Request is typically the first positional arg or named 'request'
-                if args and is_request(args[0]):
-                    view_instance.request = args[0]
-                elif "request" in kwargs:
-                    view_instance.request = kwargs["request"]
-
+                _current_action.set(_action)
+                _current_request.set(args[0])
                 return await bound_method(*args, **kwargs)
 
         else:
             # Create sync wrapper for sync methods
-            def view_handler(*args, **kwargs):
+            def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated sync view handler that calls bound method directly."""
-                # Inject request object into view instance for pagination/filtering
-                # Request is typically the first positional arg or named 'request'
-                if args and is_request(args[0]):
-                    view_instance.request = args[0]
-                elif "request" in kwargs:
-                    view_instance.request = kwargs["request"]
-
+                _current_action.set(_action)
+                _current_request.set(args[0])
                 return bound_method(*args, **kwargs)
 
         view_handler.__wrapped__ = method_handler
@@ -250,11 +242,9 @@ class ViewSet[T: Model](APIView):
     lookup_field: str = "pk"  # Field to use for object lookup (default: 'pk')
     pagination_class: type[PaginationBase] | None = None  # Optional: pagination class to use
 
-    # Action name for current request (set automatically)
-    action: str | None = None
-
-    # Request object (set automatically during dispatch)
-    request: Request | None = None
+    @property
+    def action(self) -> str:
+        return _current_action.get()
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -369,23 +359,25 @@ class ViewSet[T: Model](APIView):
 
         This method provides a hook for filtering, searching, and ordering.
         Override this method to implement custom filtering logic.
+        Access the current request via ``self.request``.
 
-        Note: Pagination is handled separately via paginate_queryset().
+        Note: Pagination is handled separately via `pagination_class` or `@paginate(...)`.
 
         Example:
             async def filter_queryset(self, queryset):
+                request = self.request
                 # Apply filters from query params
-                status = self.request.get('query', {}).get('status')
+                status = request.query.get('status')
                 if status:
                     queryset = queryset.filter(status=status)
 
                 # Apply ordering
-                ordering = self.request.get('query', {}).get('ordering')
+                ordering = request.query.get('ordering')
                 if ordering:
                     queryset = queryset.order_by(ordering)
 
                 # Apply search
-                search = self.request.get('query', {}).get('search')
+                search = request.query.get('search')
                 if search:
                     queryset = queryset.filter(name__icontains=search)
 
@@ -405,9 +397,9 @@ class ViewSet[T: Model](APIView):
         """
         Get a single object by lookup field.
 
-        Supports both the newer parameterless form, which reads the lookup
-        value from `request.params`, and the older explicit lookup form such
-        as `get_object(pk)` or `get_object(id=id)`.
+        When called without arguments, reads the lookup value from
+        ``self.request.params``.  Explicit forms such as ``get_object(pk)``
+        or ``get_object(id=id)`` are also supported.
 
         Returns:
             Model instance
@@ -423,17 +415,9 @@ class ViewSet[T: Model](APIView):
                 raise TypeError("get_object() accepts either one positional lookup value or keyword lookups")
             lookup_kwargs = {self.lookup_field: args[0]}
         elif not lookup_kwargs:
-            request = self.request
-            if request is None:
-                raise ValueError(
-                    f"Cannot resolve lookup for {self.__class__.__name__}: request object not available. "
-                    "Pass an explicit lookup value or ensure the handler received a request parameter."
-                )
-
-            params = getattr(request, "params", None)
-            if params is None or self.lookup_field not in params:
+            params = self.request.params
+            if self.lookup_field not in params:
                 raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
-
             lookup_kwargs = {self.lookup_field: params[self.lookup_field]}
         try:
             # Use aget for async retrieval
@@ -490,12 +474,13 @@ class ViewSet[T: Model](APIView):
         """
         Get the serializer class for this viewset.
 
-        Subclasses can override this as an instance method and use runtime state
-        like `self.action`. When not overridden, class-level action-specific
+        Subclasses can override this and use ``self.action`` / ``self.request``
+        for runtime decisions.  When not overridden, class-level action-specific
         serializer attributes provide the default behavior.
         """
         if action is None:
-            action = self.action
+            with suppress(LookupError):
+                action = _current_action.get()
         return self.__class__._get_default_serializer_class(action)
 
     async def perform_create(self, obj: T):
@@ -563,8 +548,7 @@ class RetrieveMixin(_ViewSet):
 
     async def retrieve(self, request: Request):
         """Retrieve a single object by primary key."""
-        obj = await self.get_object()
-        return obj
+        return await self.get_object()
 
 
 class CreateMixin(_ViewSet):
