@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use futures_util::StreamExt;
 use pyo3::prelude::*;
-use pyo3::pybacked::PyBackedBytes;
+use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
@@ -377,9 +377,10 @@ enum ResponseWireBody {
     ZeroCopyBytes(PyBackedBytes),
     FilePath(String),
     Stream {
-        media_type: String,
+        media_type: PyBackedStr,
         content_obj: Py<PyAny>,
         is_async_generator: bool,
+        ping_interval: Option<f64>,
     },
 }
 
@@ -458,20 +459,30 @@ fn parse_response_wire(py: Python<'_>, result_obj: &Py<PyAny>) -> PyResult<Parse
                     "stream payload must be StreamingResponse",
                 ));
             }
-            let media_type: String = payload
+            let media_type: PyBackedStr = payload
                 .getattr(pyo3::intern!(py, "media_type"))?
-                .extract()
-                .unwrap_or_else(|_| "application/octet-stream".to_string());
+                .extract()?;
             let content_obj: Py<PyAny> = payload.getattr(pyo3::intern!(py, "content"))?.unbind();
             let is_async_generator: bool = payload
                 .getattr(pyo3::intern!(py, "is_async_generator"))?
                 .extract()
                 .unwrap_or(false);
 
+            // For SSE streams, extract optional keep-alive ping interval
+            let ping_interval: Option<f64> = if media_type == "text/event-stream" {
+                payload
+                    .getattr(pyo3::intern!(py, "ping_interval"))
+                    .ok()
+                    .and_then(|v| v.extract().ok())
+            } else {
+                None
+            };
+
             ResponseWireBody::Stream {
                 media_type,
                 content_obj,
                 is_async_generator,
+                ping_interval,
             }
         }
         2 => ResponseWireBody::FilePath(payload.extract::<String>()?), // file
@@ -554,6 +565,7 @@ async fn build_response_from_parsed(
             media_type,
             content_obj,
             is_async_generator,
+            ping_interval,
         } => {
             let headers = response_builder::meta_to_headers(meta_ref);
             if media_type == "text/event-stream" {
@@ -567,7 +579,8 @@ async fn build_response_from_parsed(
                     mark_skip_cors(&mut response, skip_cors);
                     return response;
                 }
-                let stream = create_sse_stream(content_obj, is_async_generator);
+                let stream =
+                    create_sse_stream(content_obj, is_async_generator, ping_interval);
                 let mut response =
                     response_builder::build_sse_response(parsed.status, headers, skip_compression)
                         .streaming(stream);

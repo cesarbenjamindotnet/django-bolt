@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+import msgspec
+
 # Django import - may fail if Django not configured, kept at top for consistency
 try:
     from django.conf import settings as django_settings
@@ -324,3 +326,144 @@ class StreamingResponse(CookieMixin):
             raise TypeError(
                 f"StreamingResponse content must be a generator instance. Received type: {type(content).__name__}"
             )
+
+
+class ServerSentEvent(msgspec.Struct, frozen=True):
+    """Represents a single Server-Sent Event.
+
+    When yielded from a handler using ``response_class=EventSourceResponse``,
+    each ``ServerSentEvent`` is encoded into the SSE wire format
+    (``text/event-stream``).
+
+    Yielding a plain object (dict, Pydantic/msgspec model, etc.) instead
+    auto-JSON-encodes it as the ``data:`` field.
+
+    Examples::
+
+        yield ServerSentEvent(data={"price": 42.5}, event="update", id="1")
+        yield ServerSentEvent(raw_data="plain text line", comment="keepalive")
+        yield ServerSentEvent(retry=5000)
+    """
+
+    data: Any = None
+    raw_data: str | None = None
+    event: str | None = None
+    id: str | None = None
+    retry: int | None = None
+    comment: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.data is not None and self.raw_data is not None:
+            raise ValueError(
+                "Cannot set both 'data' and 'raw_data' on the same "
+                "ServerSentEvent. Use 'data' for JSON-serialized payloads "
+                "or 'raw_data' for pre-formatted strings."
+            )
+        if self.id is not None and "\0" in self.id:
+            raise ValueError("SSE 'id' must not contain null characters")
+        if self.retry is not None and self.retry < 0:
+            raise ValueError("SSE 'retry' must be a non-negative integer")
+
+
+def format_sse_event(
+    *,
+    data_str: str | None = None,
+    data_bytes: bytes | None = None,
+    event: str | None = None,
+    id: str | None = None,
+    retry: int | None = None,
+    comment: str | None = None,
+) -> bytes:
+    """Build SSE wire-format bytes from pre-serialized data.
+
+    The result always ends with ``\\n\\n`` (the event terminator).
+
+    Pass ``data_bytes`` instead of ``data_str`` when the payload is already
+    encoded (e.g. from msgspec) to avoid a decode/encode round-trip.
+    """
+    # Fast path: data-only event with pre-encoded bytes (most common from auto-framing)
+    if (
+        data_bytes is not None
+        and event is None
+        and id is None
+        and retry is None
+        and comment is None
+    ):
+        return b"data: " + data_bytes + b"\n\n"
+
+    lines: list[str] = []
+
+    if comment is not None:
+        for line in comment.splitlines():
+            lines.append(f": {line}")
+
+    if event is not None:
+        lines.append(f"event: {event}")
+
+    if data_str is not None:
+        for line in data_str.splitlines():
+            lines.append(f"data: {line}")
+    elif data_bytes is not None:
+        for line in data_bytes.decode("utf-8").splitlines():
+            lines.append(f"data: {line}")
+
+    if id is not None:
+        lines.append(f"id: {id}")
+
+    if retry is not None:
+        lines.append(f"retry: {retry}")
+
+    lines.append("")
+    lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+# Keep-alive comment per the SSE spec recommendation
+SSE_KEEPALIVE_COMMENT = b": ping\n\n"
+
+# Default seconds between keep-alive pings when the generator is idle
+SSE_DEFAULT_PING_INTERVAL: float = 15.0
+
+
+class EventSourceResponse(StreamingResponse):
+    """Streaming response with ``text/event-stream`` media type.
+
+    Use as ``response_class=EventSourceResponse`` on a route decorator to enable
+    Server-Sent Events with automatic SSE framing, compression skipping, and
+    keep-alive pings.
+
+    Works with **any HTTP method** (GET, POST, etc.), which makes it compatible
+    with protocols like MCP that stream SSE over POST.
+
+    **Implicit (preferred)** — the handler itself is a generator::
+
+        @api.get("/items/stream", response_class=EventSourceResponse)
+        async def stream_items() -> AsyncIterable[Item]:
+            for item in items:
+                yield item
+
+    **Explicit** — full control over the response::
+
+        @api.get("/stream")
+        async def stream():
+            async def gen():
+                yield {"message": "hello"}
+                yield ServerSentEvent(data=item, event="update", id="1")
+            return EventSourceResponse(gen())
+    """
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        ping_interval: float | None = SSE_DEFAULT_PING_INTERVAL,
+    ):
+        super().__init__(
+            content,
+            status_code=status_code,
+            media_type="text/event-stream",
+            headers=headers,
+        )
+        self.ping_interval = ping_interval

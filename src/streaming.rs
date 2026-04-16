@@ -1,11 +1,17 @@
 use actix_web::web::Bytes;
-use futures_util::future::join_all;
-use futures_util::{stream, Stream};
+use futures_util::{stream, Stream, StreamExt};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyMemoryView, PyString};
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyByteArray, PyDict, PyMemoryView, PyModule, PyString};
+use pyo3::IntoPyObjectExt;
+use pyo3_async_runtimes::TaskLocals;
+use std::ffi::CString;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::state::{get_max_sync_streaming_threads, ACTIVE_SYNC_STREAMING_THREADS, TASK_LOCALS};
 // Streaming uses direct_stream only in higher-level handler; not directly here
@@ -18,10 +24,13 @@ use crate::state::{get_max_sync_streaming_threads, ACTIVE_SYNC_STREAMING_THREADS
 
 #[inline(always)]
 pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
-    if let Ok(py_bytes) = value.cast::<PyBytes>() {
-        return Some(Bytes::copy_from_slice(py_bytes.as_bytes()));
+    // Zero-copy path: PyBackedBytes holds a reference to the Python bytes object.
+    // Bytes::from_owner wraps it without memcpy.
+    if let Ok(backed) = value.extract::<PyBackedBytes>() {
+        return Some(Bytes::from_owner(backed));
     }
     if let Ok(py_bytearray) = value.cast::<PyByteArray>() {
+        // bytearray is mutable so we must copy
         return Some(Bytes::copy_from_slice(unsafe { py_bytearray.as_bytes() }));
     }
     if let Ok(py_str) = value.cast::<PyString>() {
@@ -33,20 +42,19 @@ pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
     }
     if let Ok(memory_view) = value.cast::<PyMemoryView>() {
         if let Ok(bytes_obj) = memory_view.call_method0("tobytes") {
-            if let Ok(py_bytes) = bytes_obj.cast::<PyBytes>() {
-                return Some(Bytes::copy_from_slice(py_bytes.as_bytes()));
+            if let Ok(backed) = bytes_obj.extract::<PyBackedBytes>() {
+                return Some(Bytes::from_owner(backed));
             }
         }
     }
-    // OPTIMIZATION: Use interned strings for attribute checks
     let py = value.py();
     if value
         .hasattr(pyo3::intern!(py, "__bytes__"))
         .unwrap_or(false)
     {
         if let Ok(buffer) = value.call_method0(pyo3::intern!(py, "__bytes__")) {
-            if let Ok(py_bytes) = buffer.cast::<PyBytes>() {
-                return Some(Bytes::copy_from_slice(py_bytes.as_bytes()));
+            if let Ok(backed) = buffer.extract::<PyBackedBytes>() {
+                return Some(Bytes::from_owner(backed));
             }
         }
     }
@@ -55,6 +63,131 @@ pub fn convert_python_chunk(value: &Bound<'_, PyAny>) -> Option<Bytes> {
         return Some(Bytes::from(s.into_bytes()));
     }
     None
+}
+
+const ASYNC_STREAM_FORWARDER: &str = r#"
+import inspect
+
+async def forward(gen, sender):
+    iterator = gen.__aiter__() if hasattr(gen, "__aiter__") else gen
+    try:
+        while True:
+            item = await iterator.__anext__()
+            should_continue = sender.send(item)
+            if inspect.isawaitable(should_continue):
+                should_continue = await should_continue
+            if should_continue:
+                continue
+            break
+    except StopAsyncIteration:
+        pass
+    except Exception:
+        # Match the existing behavior of terminating the stream when the Python
+        # iterator raises. The response body simply ends instead of surfacing a
+        # noisy "Task exception was never retrieved" diagnostic.
+        pass
+    finally:
+        try:
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                maybe_awaitable = aclose()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+        except Exception:
+            pass
+        sender.close()
+"#;
+
+#[pyclass]
+struct AsyncStreamSender {
+    locals: TaskLocals,
+    tx: Arc<Mutex<Option<mpsc::Sender<Result<Bytes, std::io::Error>>>>>,
+}
+
+#[pymethods]
+impl AsyncStreamSender {
+    fn send(&mut self, item: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        Python::attach(|py| {
+            let bytes = convert_python_chunk(&item.bind(py)).ok_or_else(|| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "StreamingResponse async iterator yielded an unsupported chunk type",
+                )
+            })?;
+            let tx = self.tx.lock().unwrap().as_ref().cloned();
+            let Some(tx) = tx else {
+                return false.into_py_any(py);
+            };
+
+            // try_send consumes the value, so we only clone if the channel is
+            // full and we need to retry with the async path.
+            match tx.try_send(Ok(bytes)) {
+                Ok(()) => true.into_py_any(py),
+                Err(TrySendError::Full(Ok(bytes))) => {
+                    pyo3_async_runtimes::tokio::future_into_py_with_locals(
+                        py,
+                        self.locals.clone(),
+                        async move { Ok(tx.send(Ok(bytes)).await.is_ok()) },
+                    )
+                    .map(Bound::unbind)
+                }
+                Err(TrySendError::Full(_) | TrySendError::Closed(_)) => false.into_py_any(py),
+            }
+        })
+    }
+
+    fn close(&mut self) {
+        self.tx.lock().unwrap().take();
+    }
+}
+
+fn get_async_stream_forwarder(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static FORWARDER_MODULE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+    let module = FORWARDER_MODULE.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let code = CString::new(ASYNC_STREAM_FORWARDER).expect("valid async stream forwarder");
+        let file = CString::new("django_bolt/async_stream_forwarder.py").expect("valid filename");
+        let name = CString::new("django_bolt_async_stream_forwarder").expect("valid module name");
+        Ok(
+            PyModule::from_code(py, code.as_c_str(), file.as_c_str(), name.as_c_str())?
+                .into_any()
+                .unbind(),
+        )
+    })?;
+
+    Ok(module.bind(py))
+}
+
+fn schedule_async_stream_forwarder(
+    py: Python<'_>,
+    content: &Py<PyAny>,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> PyResult<()> {
+    let locals = TASK_LOCALS
+        .get()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Asyncio loop not initialized"))?
+        .clone();
+    let sender = Py::new(
+        py,
+        AsyncStreamSender {
+            locals: locals.clone(),
+            tx: Arc::new(Mutex::new(Some(tx))),
+        },
+    )?;
+    let forwarder = get_async_stream_forwarder(py)?;
+    let coroutine =
+        forwarder.call_method1(pyo3::intern!(py, "forward"), (content.bind(py), sender))?;
+    let event_loop = locals.event_loop(py);
+    let kwargs = PyDict::new(py);
+    kwargs.set_item(pyo3::intern!(py, "context"), locals.context(py))?;
+    event_loop.call_method(
+        pyo3::intern!(py, "call_soon_threadsafe"),
+        (
+            event_loop.getattr(pyo3::intern!(py, "create_task"))?,
+            coroutine,
+        ),
+        Some(&kwargs),
+    )?;
+    Ok(())
 }
 
 /// Create a stream with default batch sizes from environment
@@ -76,17 +209,50 @@ pub fn create_python_stream(
 }
 
 /// Create a stream for SSE that sends items immediately (batch_size=1)
+/// with optional keep-alive pings when idle.
 pub fn create_sse_stream(
     content: Py<PyAny>,
     is_async_generator: bool,
+    ping_interval: Option<f64>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
-    create_python_stream_with_config(content, 1, 1, is_async_generator)
+    let inner = create_python_stream_with_config(content, 1, 1, is_async_generator);
+
+    match ping_interval {
+        Some(interval) if interval > 0.0 => {
+            Box::pin(keepalive_stream(inner, interval))
+        }
+        _ => inner,
+    }
+}
+
+/// Wrap a stream with keep-alive ping injection.
+/// Emits `: ping\n\n` when the inner stream is idle for `interval_secs`.
+fn keepalive_stream(
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    interval_secs: f64,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let duration = std::time::Duration::from_secs_f64(interval_secs);
+    let keepalive_bytes: Bytes = Bytes::from_static(b": ping\n\n");
+
+    stream::unfold(
+        (inner, duration, keepalive_bytes),
+        |(mut inner, duration, keepalive_bytes)| async move {
+            match tokio::time::timeout(duration, inner.next()).await {
+                Ok(Some(item)) => Some((item, (inner, duration, keepalive_bytes))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Ok(keepalive_bytes.clone()),
+                    (inner, duration, keepalive_bytes),
+                )),
+            }
+        },
+    )
 }
 
 /// Internal function with configurable batch sizes
 fn create_python_stream_with_config(
     content: Py<PyAny>,
-    async_batch_size: usize,
+    _async_batch_size: usize,
     sync_batch_size: usize,
     is_async_from_metadata: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
@@ -95,11 +261,6 @@ fn create_python_stream_with_config(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(32);
-    let fast_path_threshold: usize = std::env::var("DJANGO_BOLT_STREAM_FAST_PATH_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(10);
     // Note: content is guaranteed to be a generator instance (not a callable)
     // because StreamingResponse validates this in Python at instantiation time.
     // The is_async_generator flag was pre-computed from Python's inspect.
@@ -111,208 +272,16 @@ fn create_python_stream_with_config(
     let is_async_final = is_async_iter;
 
     if is_async_final {
-        let fast_path = fast_path_threshold;
-        tokio::spawn(async move {
-            let is_optimized_batcher = Python::attach(|py| {
-                if let Ok(name) = resolved_target_final.bind(py).get_type().name() {
-                    name.to_string().contains("OptimizedStreamBatcher")
-                } else {
-                    false
-                }
-            });
-
-            // OPTIMIZATION: Use interned strings for iterator protocol checks
-            let async_iter: Option<Py<PyAny>> = Python::attach(|py| {
-                let b = resolved_target_final.bind(py);
-                if b.hasattr(pyo3::intern!(py, "__aiter__")).unwrap_or(false) {
-                    match b.call_method0(pyo3::intern!(py, "__aiter__")) {
-                        Ok(it) => Some(it.unbind()),
-                        Err(_) => None,
-                    }
-                } else if b.hasattr(pyo3::intern!(py, "__anext__")).unwrap_or(false) {
-                    Some(resolved_target_final.clone_ref(py))
-                } else {
-                    None
-                }
-            });
-
-            if async_iter.is_none() {
-                let _ = tx
-                    .send(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Failed to initialize async iterator",
-                    )))
-                    .await;
-                return;
-            }
-            let async_iter = async_iter.unwrap();
-
-            let mut exhausted = false;
-            let mut batch_futures = Vec::with_capacity(async_batch_size);
-            let mut consecutive_small_batches = 0u8;
-            let mut current_batch_size = std::cmp::min(async_batch_size, fast_path);
-
-            while !exhausted {
-                batch_futures.clear();
-                Python::attach(|py| {
-                    // Reuse the global event loop locals initialized at server startup
-                    let locals = match TASK_LOCALS.get() {
-                        Some(l) => l,
-                        None => {
-                            exhausted = true;
-                            return;
-                        }
-                    };
-
-                    let iterations = if is_optimized_batcher {
-                        1
-                    } else {
-                        current_batch_size
-                    };
-                    for _ in 0..iterations {
-                        // OPTIMIZATION: Use interned string for __anext__
-                        match async_iter
-                            .bind(py)
-                            .call_method0(pyo3::intern!(py, "__anext__"))
-                        {
-                            Ok(awaitable) => {
-                                match pyo3_async_runtimes::into_future_with_locals(
-                                    locals, awaitable,
-                                ) {
-                                    Ok(f) => batch_futures.push(f),
-                                    Err(_) => {
-                                        exhausted = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                                    exhausted = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                if batch_futures.len() < current_batch_size / 2 {
-                    consecutive_small_batches += 1;
-                    if consecutive_small_batches >= 3 && current_batch_size > 1 {
-                        current_batch_size = std::cmp::max(1, current_batch_size / 2);
-                        consecutive_small_batches = 0;
-                    }
-                } else if batch_futures.len() == current_batch_size
-                    && current_batch_size < async_batch_size
-                {
-                    current_batch_size = std::cmp::min(async_batch_size, current_batch_size * 2);
-                    consecutive_small_batches = 0;
-                }
-
-                if batch_futures.is_empty() {
-                    break;
-                }
-
-                let results = join_all(batch_futures.drain(..)).await;
-
-                let mut got_stop_iteration = false;
-                for result in results {
-                    match result {
-                        Ok(obj) => {
-                            let bytes_opt = Python::attach(|py| {
-                                let v = obj.bind(py);
-                                if is_optimized_batcher {
-                                    if let Ok(py_bytes) = v.cast::<PyBytes>() {
-                                        Some(Bytes::copy_from_slice(py_bytes.as_bytes()))
-                                    } else {
-                                        super::streaming::convert_python_chunk(&v)
-                                    }
-                                } else {
-                                    super::streaming::convert_python_chunk(&v)
-                                }
-                            });
-                            if let Some(bytes) = bytes_opt {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    // Client disconnected - close the async generator to run cleanup code
-                                    let close_result = Python::attach(|py| {
-                                        let iter_bound = async_iter.bind(py);
-                                        // OPTIMIZATION: Use interned string for aclose
-                                        if iter_bound
-                                            .hasattr(pyo3::intern!(py, "aclose"))
-                                            .unwrap_or(false)
-                                        {
-                                            if let Ok(awaitable) =
-                                                iter_bound.call_method0(pyo3::intern!(py, "aclose"))
-                                            {
-                                                if let Some(locals) = TASK_LOCALS.get() {
-                                                    return pyo3_async_runtimes::into_future_with_locals(locals, awaitable).ok();
-                                                } else {
-                                                    eprintln!("[SSE WARNING] Unable to get task locals for async generator cleanup on disconnect");
-                                                }
-                                            } else {
-                                                eprintln!("[SSE WARNING] Failed to call aclose() on async generator during disconnect cleanup");
-                                            }
-                                        }
-                                        None
-                                    });
-                                    // Await the cleanup if we got a future
-                                    if let Some(close_future) = close_result {
-                                        if let Err(e) = close_future.await {
-                                            eprintln!("[SSE WARNING] Error during async generator cleanup on client disconnect: {}", e);
-                                        }
-                                    }
-                                    exhausted = true;
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            Python::attach(|py| {
-                                if e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py) {
-                                    got_stop_iteration = true;
-                                    exhausted = true;
-                                }
-                            });
-                        }
-                    }
-                }
-                if got_stop_iteration {
-                    exhausted = true;
-                }
-            }
-
-            // Ensure async generator cleanup runs
-            let close_result = Python::attach(|py| {
-                let iter_bound = async_iter.bind(py);
-                // OPTIMIZATION: Use interned string for aclose
-                if iter_bound
-                    .hasattr(pyo3::intern!(py, "aclose"))
-                    .unwrap_or(false)
-                {
-                    if let Ok(awaitable) = iter_bound.call_method0(pyo3::intern!(py, "aclose")) {
-                        if let Some(locals) = TASK_LOCALS.get() {
-                            return pyo3_async_runtimes::into_future_with_locals(locals, awaitable)
-                                .ok();
-                        } else {
-                            eprintln!("[SSE WARNING] Unable to get task locals for async generator cleanup at end of stream");
-                        }
-                    } else {
-                        eprintln!("[SSE WARNING] Failed to call aclose() on async generator at end of stream cleanup");
-                    }
-                }
-                None
-            });
-            if let Some(close_future) = close_result {
-                if let Err(e) = close_future.await {
-                    eprintln!(
-                        "[SSE WARNING] Error during async generator cleanup at end of stream: {}",
-                        e
-                    );
-                }
-            }
+        let start_result = Python::attach(|py| {
+            schedule_async_stream_forwarder(py, &resolved_target_final, tx.clone())
         });
+        if let Err(err) = start_result {
+            let _ = tx.try_send(Err(std::io::Error::other(format!(
+                "Failed to initialize async stream forwarder: {err}"
+            ))));
+        }
+        drop(tx);
 
-        // Async streaming successful, return stream
         let s = stream::unfold(rx, |mut rx| async move {
             match rx.recv().await {
                 Some(item) => Some((item, rx)),

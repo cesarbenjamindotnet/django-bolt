@@ -35,7 +35,18 @@ from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 from . import _json
 from ._kwargs import coerce_to_response_type, coerce_to_response_type_async
 from .cookies import Cookie
-from .responses import HTML, JSON, File, FileResponse, PlainText, Redirect, StreamingResponse
+from .responses import (
+    HTML,
+    JSON,
+    EventSourceResponse,
+    File,
+    FileResponse,
+    PlainText,
+    Redirect,
+    ServerSentEvent,
+    StreamingResponse,
+    format_sse_event,
+)
 from .responses import Response as ResponseClass
 
 if TYPE_CHECKING:
@@ -406,7 +417,50 @@ async def _wrap_async_stream_chunks(content: Any, item_type: Any | None, meta: H
         yield await _serialize_stream_chunk_async(chunk, validator)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SSE (Server-Sent Events) auto-framing
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _serialize_sse_chunk(chunk: Any) -> bytes:
+    """Serialize a single yielded item into SSE wire-format bytes."""
+    if isinstance(chunk, (bytes, bytearray, memoryview)):
+        return bytes(chunk) if not isinstance(chunk, bytes) else chunk
+    if isinstance(chunk, str):
+        return chunk.encode("utf-8")
+    if isinstance(chunk, ServerSentEvent):
+        if chunk.raw_data is not None:
+            return format_sse_event(data_str=chunk.raw_data, event=chunk.event, id=chunk.id, retry=chunk.retry, comment=chunk.comment)
+        return format_sse_event(
+            data_bytes=_json.encode(chunk.data) if chunk.data is not None else None,
+            event=chunk.event,
+            id=chunk.id,
+            retry=chunk.retry,
+            comment=chunk.comment,
+        )
+    # Plain objects (dict, list, msgspec.Struct, etc.)
+    return format_sse_event(data_bytes=_json.encode(chunk))
+
+
+def _wrap_sync_sse_chunks(content: Any):
+    for chunk in content:
+        yield _serialize_sse_chunk(chunk)
+
+
+async def _wrap_async_sse_chunks(content: Any):
+    async for chunk in content:
+        yield _serialize_sse_chunk(chunk)
+
+
 def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
+    # Auto-wrap EventSourceResponse generator with SSE framing.
+    # Mutate in place so ping_interval and other attributes are preserved for Rust.
+    if isinstance(stream_response, EventSourceResponse):
+        if stream_response.is_async_generator:
+            stream_response.content = _wrap_async_sse_chunks(stream_response.content)
+        else:
+            stream_response.content = _wrap_sync_sse_chunks(stream_response.content)
+
     custom_headers: dict[str, str] = {"content-type": stream_response.media_type}
     if stream_response.headers:
         custom_headers.update(stream_response.headers)
@@ -420,6 +474,7 @@ def _build_auto_streaming_response(
     stream_info: tuple[bool, Any | None],
     meta: HandlerMetadata | dict[str, Any],
     status_code: int,
+    response_class: type | None = None,
 ) -> StreamingResponse | None:
     """Auto-wrap generator/iterator return values into StreamingResponse."""
     is_stream_annotation, item_type = stream_info
@@ -428,6 +483,11 @@ def _build_auto_streaming_response(
 
     if not is_generator_result and not (is_stream_annotation and _is_stream_protocol_instance(result)):
         return None
+
+    # When response_class=EventSourceResponse, wrap as EventSourceResponse
+    # SSE framing is applied later in _to_stream_wire
+    if response_class is not None and issubclass(response_class, EventSourceResponse):
+        return EventSourceResponse(result, status_code=status_code)
 
     needs_json_chunk_encoding = (
         is_stream_annotation and item_type is not None and item_type not in _RAW_STREAM_CHUNK_TYPES
@@ -460,6 +520,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
 
     default_status_code = meta["default_status_code"]
     stream_info = meta.get("_stream_info", (False, None))
+    response_class = meta.get("response_class")
 
     async def data_handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
         current_status = default_status_code if status_code is None else status_code
@@ -481,7 +542,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, str):
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
-        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status)
+        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
         if auto_stream is not None:
             return _to_stream_wire(auto_stream)
 
@@ -523,7 +584,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, str):
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
-        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status)
+        auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
         if auto_stream is not None:
             return _to_stream_wire(auto_stream)
 

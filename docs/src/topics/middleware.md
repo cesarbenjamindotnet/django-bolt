@@ -130,6 +130,10 @@ async def stream():
     return StreamingResponse(generate())
 ```
 
+!!! note
+    `EventSourceResponse` and all SSE streams (`text/event-stream`) skip compression
+    automatically. You only need `@no_compress` for non-SSE streaming.
+
 ### Compression settings
 
 Configure in `settings.py`:

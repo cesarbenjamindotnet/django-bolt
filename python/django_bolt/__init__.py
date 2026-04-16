@@ -128,7 +128,14 @@ from .params import Depends
 
 # Type-safe Request object
 from .request import Request
-from .responses import JSON, Response, StreamingResponse
+from .responses import (
+    JSON,
+    EventSourceResponse,
+    Response,
+    ServerSentEvent,
+    StreamingResponse,
+    format_sse_event,
+)
 from .router import Router
 from .types import (
     APIKeyAuth,
@@ -175,6 +182,9 @@ __all__ = [
     "Response",
     "JSON",
     "StreamingResponse",
+    "EventSourceResponse",
+    "ServerSentEvent",
+    "format_sse_event",
     "CompressionConfig",
     "Cookie",
     "Depends",
