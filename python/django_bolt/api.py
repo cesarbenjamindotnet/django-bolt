@@ -6,7 +6,6 @@ import dis
 import inspect
 import sys
 import threading
-import types
 from collections.abc import Callable
 from contextlib import suppress
 from functools import partial
@@ -32,6 +31,7 @@ from ._kwargs import (
     compile_websocket_binder,
     extract_response_metadata,
 )
+from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .admin.static_routes import StaticRouteRegistrar
 from .analysis import analyze_handler, warn_blocking_handler
@@ -57,7 +57,7 @@ from .openapi import (
 )
 from .openapi.routes import OpenAPIRouteRegistrar
 from .openapi.schema_generator import SchemaGenerator
-from .pagination import extract_pagination_item_type
+from .pagination import extract_pagination_item_type, paginate
 from .responses import JSON as _JSONResponse
 from .router import Router
 from .serialization import (
@@ -894,14 +894,14 @@ class BoltAPI:
         Usage:
             @api.viewset("/users")
             class UserViewSet(ViewSet):
-                async def list(self) -> list[User]:
+                async def list(self, request) -> list[User]:
                     return User.objects.all()[:100]
 
-                async def retrieve(self, id: int) -> User:
+                async def retrieve(self, request, id: int) -> User:
                     return await User.objects.aget(id=id)
 
                 @action(methods=["POST"], detail=True)
-                async def activate(self, id: int):
+                async def activate(self, request, id: int):
                     user = await User.objects.aget(id=id)
                     user.is_active = True
                     await user.asave()
@@ -927,7 +927,7 @@ class BoltAPI:
             Decorator function that registers the viewset
         """
 
-        def decorator(viewset_cls: type) -> type:
+        def decorator(viewset_cls: type[ViewSet]) -> type[ViewSet]:
             # Validate that viewset_cls is a ViewSet subclass
             if not issubclass(viewset_cls, ViewSet):
                 raise TypeError(f"ViewSet class {viewset_cls.__name__} must inherit from ViewSet")
@@ -938,20 +938,20 @@ class BoltAPI:
                 actual_lookup_field = viewset_cls.lookup_field
 
             # Define standard action mappings with HTTP-compliant status codes
-            # Format: action_name: (method, path, action_override, default_status_code)
+            # Format: action_name: (method, path, default_status_code)
             action_routes = {
                 # Collection routes (no pk)
-                "list": ("GET", path, None, None),
-                "create": ("POST", path, None, HTTP_201_CREATED),
+                "list": ("GET", path, None),
+                "create": ("POST", path, HTTP_201_CREATED),
                 # Detail routes (with pk)
-                "retrieve": ("GET", f"{path}/{{{actual_lookup_field}}}", "retrieve", None),
-                "update": ("PUT", f"{path}/{{{actual_lookup_field}}}", "update", None),
-                "partial_update": ("PATCH", f"{path}/{{{actual_lookup_field}}}", "partial_update", None),
-                "destroy": ("DELETE", f"{path}/{{{actual_lookup_field}}}", "destroy", HTTP_204_NO_CONTENT),
+                "retrieve": ("GET", f"{path}/{{{actual_lookup_field}}}", None),
+                "update": ("PUT", f"{path}/{{{actual_lookup_field}}}", None),
+                "partial_update": ("PATCH", f"{path}/{{{actual_lookup_field}}}", None),
+                "destroy": ("DELETE", f"{path}/{{{actual_lookup_field}}}", HTTP_204_NO_CONTENT),
             }
 
             # Register routes for each implemented action
-            for action_name, (http_method, route_path, action_override, action_status_code) in action_routes.items():
+            for action_name, (http_method, route_path, action_status_code) in action_routes.items():
                 # Check if the viewset implements this action
                 if not hasattr(viewset_cls, action_name):
                     continue
@@ -961,7 +961,7 @@ class BoltAPI:
                     continue
 
                 # Use action name (e.g., "list") not HTTP method name (e.g., "get")
-                handler = viewset_cls.as_view(http_method.lower(), action=action_override or action_name)
+                handler = viewset_cls.as_view(http_method.lower(), action=action_name)
 
                 # Merge guards and auth
                 merged_guards = guards
@@ -986,6 +986,25 @@ class BoltAPI:
                     if original is not None:
                         method_response_model = getattr(original, "response_model", _RESPONSE_MODEL_UNSET)
 
+                # Extract response model from type hints if not already determined
+                if method_response_model is _RESPONSE_MODEL_UNSET:
+                    globalns = sys.modules.get(handler.__module__, {}).__dict__ if handler.__module__ else {}
+                    type_hints = get_type_hints(handler, globalns=globalns, include_extras=True)
+                    method_response_model = type_hints.get("return", _RESPONSE_MODEL_UNSET)
+
+                # Fallback to the viewset's serializer class when possible, but
+                # don't let dynamic runtime selection crash registration.
+                if method_response_model is _RESPONSE_MODEL_UNSET:
+                    inferred_serializer = self._infer_viewset_serializer_class(
+                        viewset_cls,
+                        action_name if action_name == "list" else "retrieve",
+                    )
+                    if inferred_serializer is not _RESPONSE_MODEL_UNSET:
+                        if action_name == "list":
+                            method_response_model = list[inferred_serializer]
+                        elif action_name != "destroy":
+                            method_response_model = inferred_serializer
+
                 merged_validate_response = validate_response
                 if merged_validate_response is None:
                     merged_validate_response = getattr(action_method, "validate_response", None)
@@ -995,6 +1014,14 @@ class BoltAPI:
                         merged_validate_response = getattr(original, "validate_response", None)
                 if merged_validate_response is None and hasattr(handler, "__bolt_validate_response__"):
                     merged_validate_response = handler.__bolt_validate_response__
+
+                # Apply pagination decorator for list actions when  handler is not paginated and pagination class is configured
+                if (
+                    action_name == "list"
+                    and not getattr(handler, "__paginated__", False)
+                    and viewset_cls.pagination_class
+                ):
+                    handler = paginate(viewset_cls.pagination_class)(handler)
 
                 # Register the route
                 route_decorator = self._route_decorator(
@@ -1016,6 +1043,19 @@ class BoltAPI:
 
         return decorator
 
+    def _infer_viewset_serializer_class(self, viewset_cls: type[ViewSet], action_name: str):
+        """
+        Best-effort serializer inference for unannotated viewset actions.
+
+        Called at registration time (no request context), so ``self.action``
+        is unavailable. We pass *action_name* explicitly instead.
+        """
+        try:
+            view_instance = viewset_cls()
+            return view_instance.get_serializer_class(action_name)
+        except (AttributeError, TypeError, ValueError):
+            return _RESPONSE_MODEL_UNSET
+
     def _register_custom_actions(self, view_cls: type, base_path: str | None, lookup_field: str | None):
         """
         Scan a ViewSet class for custom action methods and register them.
@@ -1036,7 +1076,7 @@ class BoltAPI:
         # Scan all attributes in the class
         for name in dir(view_cls):
             # Skip private attributes and standard action methods
-            if name.startswith("_") or name.lower() in [
+            if name.startswith("_") or name.lower() in {
                 "get",
                 "post",
                 "put",
@@ -1050,7 +1090,7 @@ class BoltAPI:
                 "update",
                 "partial_update",
                 "destroy",
-            ]:
+            }:
                 continue
 
             attr = getattr(view_cls, name)
@@ -1080,13 +1120,35 @@ class BoltAPI:
 
                 # Register route for each HTTP method
                 for http_method in attr.methods:
-                    # Create a wrapper that calls the method as an instance method
-                    async def custom_action_handler(*args, __unbound_fn=unbound_fn, __view_cls=view_cls, **kwargs):
-                        """Wrapper for custom action method."""
-                        view = __view_cls()
-                        # Bind the unbound method to the view instance
-                        bound_method = types.MethodType(__unbound_fn, view)
-                        return await bound_method(*args, **kwargs)
+                    # Create a wrapper that instantiates the view per request,
+                    # sets the ContextVar-based request/action, and forwards.
+                    is_async_method = inspect.iscoroutinefunction(unbound_fn)
+                    if is_async_method:
+                        async def custom_action_handler(
+                            *args,
+                            __unbound_fn=unbound_fn,
+                            __view_cls=view_cls,
+                            _action=name,
+                            **kwargs,
+                        ):
+                            """Wrapper for custom action method."""
+                            _current_action.set(_action)
+                            _current_request.set(args[0])
+                            view_instance = __view_cls()
+                            return await __unbound_fn(view_instance, *args, **kwargs)
+                    else:
+                        def custom_action_handler(
+                            *args,
+                            __unbound_fn=unbound_fn,
+                            __view_cls=view_cls,
+                            _action=name,
+                            **kwargs,
+                        ):
+                            """Wrapper for custom action method."""
+                            _current_action.set(_action)
+                            _current_request.set(args[0])
+                            view_instance = __view_cls()
+                            return __unbound_fn(view_instance, *args, **kwargs)
 
                     # Preserve signature and annotations from original method
                     sig = inspect.signature(unbound_fn)

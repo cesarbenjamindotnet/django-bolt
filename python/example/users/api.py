@@ -25,7 +25,7 @@ api = BoltAPI(prefix="/users")
 # ============================================================================
 
 
-class UserFull(msgspec.Struct):
+class UserFull(Serializer):
     id: int
     username: str
     email: str
@@ -34,7 +34,7 @@ class UserFull(msgspec.Struct):
     is_active: bool
 
 
-class UserMini(msgspec.Struct):
+class UserMini(Serializer):
     id: int
     username: str
 
@@ -68,14 +68,14 @@ class UserDetailSerializer(Serializer):
     is_active: bool
 
 
-class UserCreate(msgspec.Struct):
+class UserCreate(Serializer):
     username: str
     email: str
     first_name: str = ""
     last_name: str = ""
 
 
-class UserUpdate(msgspec.Struct):
+class UserUpdate(Serializer, omit_defaults=True):
     email: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -195,7 +195,6 @@ class UserFull10ViewSet(APIView):
     async def get(self, request):
         """List first 10 users (CBV version for benchmarking)."""
         users = []
-        print("get", dir(request), request)
         async for user in User.objects.only("id", "username", "email", "first_name", "last_name", "is_active")[:10]:
             users.append(
                 UserFull(
@@ -415,9 +414,9 @@ class UserPaginatedViewSet(ViewSet):
         """
         return await self.get_queryset()
 
-    async def retrieve(self, request, id: int) -> UserDetailSerializer:
+    async def retrieve(self, request) -> UserDetailSerializer:
         """Retrieve a single user by ID (not paginated)."""
-        user = await self.get_object(id=id)
+        user = await self.get_object()
         return await UserDetailSerializer.afrom_model(user)
 
 
@@ -445,7 +444,9 @@ class UserModelPaginatedViewSet(ModelViewSet):
     """
 
     queryset = User.objects.all()
-    serializer_class = UserFull  # For detail/create/update views
+    serializer_class = UserFull  # For detail/retrieve views
+    create_serializer_class = UserCreate
+    update_serializer_class = UserUpdate
     list_serializer_class = UserMini  # For list view
     pagination_class = SmallPagePagination
 

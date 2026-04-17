@@ -15,14 +15,19 @@ Example:
             return {"user": current_user.id}
 """
 
-import asyncio
 import inspect
 from collections.abc import Callable
-from typing import Any
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
 
-import msgspec
+from django.db.models import Model, ObjectDoesNotExist, QuerySet
 
+from ._json import decode
+from ._view_context import _current_action, _current_request
 from .exceptions import HTTPException
+from .pagination import PaginationBase
+from .request import Request
+from .serializers.base import Serializer
 
 
 class APIView:
@@ -53,6 +58,10 @@ class APIView:
         """
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+    @property
+    def request(self) -> Request:
+        return _current_request.get()
 
     @classmethod
     def as_view(cls, method: str, action: str | None = None) -> Callable:
@@ -85,7 +94,7 @@ class APIView:
         # DRF-style action mapping: try action name first, then HTTP method
         # Actions: list, retrieve, create, update, partial_update, destroy
         method_handler = None
-        action_name = None
+        action_name = method_lower
 
         if action:
             # Try the action name first (e.g., "list", "retrieve")
@@ -116,10 +125,6 @@ class APIView:
         # This eliminates the per-request instantiation overhead (~40% faster)
         view_instance = cls()
 
-        # Set action name once at registration time
-        if hasattr(view_instance, "action"):
-            view_instance.action = action_name
-
         # Bind the method once to eliminate lookup overhead
         bound_method = method_handler.__get__(view_instance, cls)
 
@@ -128,28 +133,18 @@ class APIView:
 
         if is_async_method:
             # Create async wrapper for async methods
-            async def view_handler(*args, **kwargs):
+            async def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated async view handler that calls bound method directly."""
-                # Inject request object into view instance for pagination/filtering
-                # Request is typically the first positional arg or named 'request'
-                if args and isinstance(args[0], dict) and "method" in args[0]:
-                    view_instance.request = args[0]
-                elif "request" in kwargs:
-                    view_instance.request = kwargs["request"]
-
+                _current_action.set(_action)
+                _current_request.set(args[0])
                 return await bound_method(*args, **kwargs)
 
         else:
             # Create sync wrapper for sync methods
-            def view_handler(*args, **kwargs):
+            def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated sync view handler that calls bound method directly."""
-                # Inject request object into view instance for pagination/filtering
-                # Request is typically the first positional arg or named 'request'
-                if args and isinstance(args[0], dict) and "method" in args[0]:
-                    view_instance.request = args[0]
-                elif "request" in kwargs:
-                    view_instance.request = kwargs["request"]
-
+                _current_action.set(_action)
+                _current_request.set(args[0])
                 return bound_method(*args, **kwargs)
 
         view_handler.__wrapped__ = method_handler
@@ -213,16 +208,7 @@ class APIView:
         return allowed
 
 
-async def _serialize_many_results(serializer_class: type[Any], items: list[Any]) -> list[Any]:
-    """Serialize already-loaded instances, parallelizing async serializer work when available."""
-    if hasattr(serializer_class, "afrom_model"):
-        return list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
-
-    fields = getattr(serializer_class, "__annotations__", {})
-    return [msgspec.convert({name: getattr(item, name, None) for name in fields}, serializer_class) for item in items]
-
-
-class ViewSet(APIView):
+class ViewSet[T: Model](APIView):
     """
     ViewSet for CRUD operations on resources.
 
@@ -238,44 +224,43 @@ class ViewSet(APIView):
             pagination_class = PageNumberPagination  # Optional: enable pagination
 
             async def list(self, request):
-                users = await self.get_queryset()
-                return [UserSchema.from_model(u) async for u in users]
+                return await self.get_queryset()
 
-            async def retrieve(self, request, pk: int):
-                user = await self.get_object(pk)
-                return UserSchema.from_model(user)
+            async def retrieve(self, request):
+                return await self.get_object()
     """
 
     # ViewSet configuration
-    queryset: Any | None = None
-    serializer_class: type | None = None
-    list_serializer_class: type | None = None  # Optional: override serializer for list operations
+    queryset: QuerySet[T] = None
+    serializer_class: type[Serializer] = None
+
+    # Optional: separate serializer for list/create/update operations
+    list_serializer_class: type[Serializer] | None = None
+    create_serializer_class: type[Serializer] | None = None
+    update_serializer_class: type[Serializer] | None = None
+
     lookup_field: str = "pk"  # Field to use for object lookup (default: 'pk')
-    pagination_class: Any | None = None  # Optional: pagination class to use
+    pagination_class: type[PaginationBase] | None = None  # Optional: pagination class to use
 
-    # Action name for current request (set automatically)
-    action: str | None = None
-
-    # Request object (set automatically during dispatch)
-    request: dict[str, Any] | None = None
+    @property
+    def action(self) -> str:
+        return _current_action.get()
 
     def __init_subclass__(cls, **kwargs):
         """
         Hook called when a subclass is created.
 
-        Converts class-level queryset to instance-level _base_queryset
-        to enable proper cloning on each access (Litestar pattern).
+        Capture an explicitly declared class-level queryset once so runtime
+        lookup can stay simple and avoid descriptor/MRO fallbacks.
         """
         super().__init_subclass__(**kwargs)
 
-        # If subclass defines queryset as class attribute, store it separately
-        if "queryset" in cls.__dict__ and cls.__dict__["queryset"] is not None:
-            # Store the base queryset for cloning
-            cls._base_queryset = cls.__dict__["queryset"]
-            # Remove the class attribute so property works
+        declared_queryset = cls.__dict__.get("queryset")
+        if declared_queryset is not None:
+            cls._base_queryset = declared_queryset
             delattr(cls, "queryset")
 
-    def _get_base_queryset(self):
+    def _get_base_queryset(self) -> QuerySet[T]:
         """
         Get the base queryset defined on the class.
 
@@ -285,12 +270,7 @@ class ViewSet(APIView):
         if hasattr(self, "_instance_queryset"):
             return self._instance_queryset
 
-        # Check class attribute (set via __init_subclass__)
-        if hasattr(self.__class__, "_base_queryset"):
-            return self.__class__._base_queryset
-
-        # Check if there's a class attribute 'queryset' (shouldn't happen after __init_subclass__)
-        return getattr(self.__class__, "queryset", None)
+        return getattr(self.__class__, "_base_queryset", None)
 
     def _clone_queryset(self, queryset):
         """
@@ -305,20 +285,15 @@ class ViewSet(APIView):
         if queryset is None:
             return None
 
-        # Always return a fresh clone to prevent state leakage
-        # Django QuerySets are lazy, so .all() creates a new QuerySet instance
-        if hasattr(queryset, "_clone"):
-            # Use Django's internal _clone() for true deep copy
-            return queryset._clone()
-        elif hasattr(queryset, "all"):
-            # Fallback to .all() which also creates a new QuerySet
+        # Django QuerySets are lazy, and .all() returns a fresh queryset.
+        if hasattr(queryset, "all") and callable(queryset.all):
             return queryset.all()
 
         # Not a QuerySet, return as-is
         return queryset
 
     @property
-    def queryset(self):  # noqa: F811
+    def queryset(self) -> QuerySet[T]:  # noqa: F811
         """
         Property that returns a fresh queryset clone on each access.
 
@@ -332,7 +307,7 @@ class ViewSet(APIView):
         return self._clone_queryset(base_qs)
 
     @queryset.setter
-    def queryset(self, value):
+    def queryset(self, value: QuerySet[T]):
         """
         Setter for queryset attribute.
 
@@ -343,7 +318,9 @@ class ViewSet(APIView):
         """
         self._instance_queryset = value
 
-    async def get_queryset(self):
+    queryset: QuerySet[T]  # make pyright happy when inheriting
+
+    async def get_queryset(self) -> QuerySet[T]:
         """
         Get the queryset for this viewset.
 
@@ -365,29 +342,42 @@ class ViewSet(APIView):
         # Return a fresh clone
         return self._clone_queryset(base_qs)
 
-    async def filter_queryset(self, queryset):
+    async def _apply_filter_queryset(self, queryset: QuerySet[T]) -> QuerySet[T]:
+        """
+        Apply filter_queryset() only when a subclass actually overrides it.
+
+        The default implementation is a no-op, so skipping the await saves a
+        small but common hot-path call for unfiltered list/detail routes.
+        """
+        if type(self).filter_queryset is ViewSet.filter_queryset:
+            return queryset
+        return await self.filter_queryset(queryset)
+
+    async def filter_queryset(self, queryset: QuerySet[T]) -> QuerySet[T]:
         """
         Given a queryset, filter it with whichever filter backends are enabled.
 
         This method provides a hook for filtering, searching, and ordering.
         Override this method to implement custom filtering logic.
+        Access the current request via ``self.request``.
 
-        Note: Pagination is handled separately via paginate_queryset().
+        Note: Pagination is handled separately via `pagination_class` or `@paginate(...)`.
 
         Example:
             async def filter_queryset(self, queryset):
+                request = self.request
                 # Apply filters from query params
-                status = self.request.get('query', {}).get('status')
+                status = request.query.get('status')
                 if status:
                     queryset = queryset.filter(status=status)
 
                 # Apply ordering
-                ordering = self.request.get('query', {}).get('ordering')
+                ordering = request.query.get('ordering')
                 if ordering:
                     queryset = queryset.order_by(ordering)
 
                 # Apply search
-                search = self.request.get('query', {}).get('search')
+                search = request.query.get('search')
                 if search:
                     queryset = queryset.filter(name__icontains=search)
 
@@ -403,54 +393,13 @@ class ViewSet(APIView):
         # Subclasses should override this method to add filtering logic
         return queryset
 
-    async def paginate_queryset(self, queryset):
-        """
-        Paginate a queryset if pagination is enabled.
-
-        This method checks if self.pagination_class is set and applies
-        pagination if available. If no pagination is configured, returns
-        the queryset unchanged.
-
-        Args:
-            queryset: The queryset to paginate
-
-        Returns:
-            PaginatedResponse if pagination enabled, otherwise queryset
-        """
-        if self.pagination_class is None:
-            return queryset
-
-        if self.request is None:
-            raise ValueError(
-                f"Cannot paginate in {self.__class__.__name__}: request object not available. "
-                f"Ensure request parameter is passed to the handler."
-            )
-
-        # Create paginator instance
-        paginator = self.pagination_class()
-
-        # Apply pagination
-        return await paginator.paginate_queryset(queryset, self.request)
-
-    def get_pagination_class(self):
-        """
-        Get the pagination class for this viewset.
-
-        Override this method to dynamically select pagination class
-        based on action or other criteria.
-
-        Returns:
-            Pagination class or None
-        """
-        return self.pagination_class
-
-    async def get_object(self, pk: Any = None, **lookup_kwargs):
+    async def get_object(self, *args: Any, **lookup_kwargs: Any) -> T:
         """
         Get a single object by lookup field.
 
-        Args:
-            pk: Primary key value (if using default lookup_field)
-            **lookup_kwargs: Additional lookup parameters
+        When called without arguments, reads the lookup value from
+        ``self.request.params``.  Explicit forms such as ``get_object(pk)``
+        or ``get_object(id=id)`` are also supported.
 
         Returns:
             Model instance
@@ -459,22 +408,39 @@ class ViewSet(APIView):
             HTTPException: If object not found (404)
         """
         queryset = await self.get_queryset()
+        queryset = await self._apply_filter_queryset(queryset)
 
-        # Build lookup kwargs
-        if pk is not None and not lookup_kwargs:
-            lookup_kwargs = {self.lookup_field: pk}
-
+        if args:
+            if len(args) != 1 or lookup_kwargs:
+                raise TypeError("get_object() accepts either one positional lookup value or keyword lookups")
+            lookup_kwargs = {self.lookup_field: args[0]}
+        elif not lookup_kwargs:
+            params = self.request.params
+            if self.lookup_field not in params:
+                raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
+            lookup_kwargs = {self.lookup_field: params[self.lookup_field]}
         try:
             # Use aget for async retrieval
             obj = await queryset.aget(**lookup_kwargs)
             return obj
-        except Exception as e:
+        except ObjectDoesNotExist as e:
             # Django raises DoesNotExist, but we convert to HTTPException
             raise HTTPException(status_code=404, detail="Not found") from e
 
-    def get_serializer_class(self, action: str | None = None):
+    @classmethod
+    def _get_default_serializer_class(cls, action: str | None = None) -> type[Serializer]:
         """
-        Get the serializer class for this viewset.
+        Resolve the default serializer class for this viewset.
+
+        Supports action-specific serializer classes:
+        - list: list_serializer_class or serializer_class
+        - create
+            - validate: create_serializer_class or serializer_class
+            - return: serializer_class
+        - update/partial_update
+            - validate: update_serializer_class or create_serializer_class or serializer_class
+            - return: serializer_class
+        - retrieve/destroy: serializer_class
 
         Override to customize serializer selection based on action.
 
@@ -484,324 +450,233 @@ class ViewSet(APIView):
         Returns:
             Serializer class
         """
-        # Use instance action if not provided
-        if action is None:
-            action = self.action
 
-        # Use list_serializer_class for list actions if defined
-        if action == "list" and self.list_serializer_class is not None:
-            return self.list_serializer_class
+        # Action-specific serializer classes
+        if action == "list" and cls.list_serializer_class is not None:
+            return cls.list_serializer_class
+        elif action == "create" and cls.create_serializer_class is not None:
+            return cls.create_serializer_class
+        elif action in ("update", "partial_update"):
+            if cls.update_serializer_class is not None:
+                return cls.update_serializer_class
+            elif cls.create_serializer_class is not None:
+                return cls.create_serializer_class
 
-        if self.serializer_class is None:
+        if cls.serializer_class is None:
             raise ValueError(
-                f"'{self.__class__.__name__}' should either include a `serializer_class` attribute, "
+                f"'{cls.__name__}' should either include a `serializer_class` attribute, "
                 f"or override the `get_serializer_class()` method."
             )
-        return self.serializer_class
 
-    def get_serializer(self, instance=None, data=None, many=False):
+        return cls.serializer_class
+
+    def get_serializer_class(self, action: str | None = None) -> type[Serializer]:
         """
-        Get a serializer instance.
+        Get the serializer class for this viewset.
 
-        Args:
-            instance: Model instance to serialize (for reading)
-            data: Data to validate/deserialize (for writing)
-            many: Whether serializing multiple instances
-
-        Returns:
-            Serializer instance or list of serialized data
+        Subclasses can override this and use ``self.action`` / ``self.request``
+        for runtime decisions.  When not overridden, class-level action-specific
+        serializer attributes provide the default behavior.
         """
-        serializer_class = self.get_serializer_class()
+        if action is None:
+            with suppress(LookupError):
+                action = _current_action.get()
+        return self.__class__._get_default_serializer_class(action)
 
-        # If it's a msgspec.Struct, handle conversion
-        if hasattr(serializer_class, "__struct_fields__"):
-            if instance is not None:
-                if many:
-                    # Serialize multiple instances
-                    if hasattr(serializer_class, "from_model"):
-                        return [serializer_class.from_model(obj) for obj in instance]
-                    else:
-                        # Manual mapping
-                        fields = getattr(serializer_class, "__annotations__", {})
-                        return [
-                            msgspec.convert({name: getattr(obj, name, None) for name in fields}, serializer_class)
-                            for obj in instance
-                        ]
-                else:
-                    # Serialize single instance
-                    if hasattr(serializer_class, "from_model"):
-                        return serializer_class.from_model(instance)
-                    else:
-                        fields = getattr(serializer_class, "__annotations__", {})
-                        mapped = {name: getattr(instance, name, None) for name in fields}
-                        return msgspec.convert(mapped, serializer_class)
-            elif data is not None:
-                # Data is already validated by msgspec at parameter binding
-                return data
+    async def perform_create(self, obj: T):
+        await obj.asave()
 
-        return serializer_class
+    async def perform_update(self, obj: T):
+        await obj.asave()
+
+    async def perform_destroy(self, obj: T):
+        await obj.adelete()
+
+    async def perform_destory(self, obj: T):
+        # Backward-compatible alias for the misspelled hook introduced on this branch.
+        await self.perform_destroy(obj)
+
+    async def _perform_destroy(self, obj: T):
+        # If a subclass only overrides the misspelled hook, keep honoring it so
+        # existing branch consumers don't silently lose their custom behavior.
+        if (
+            type(self).perform_destory is not ViewSet.perform_destory
+            and type(self).perform_destroy is ViewSet.perform_destroy
+        ):
+            await self.perform_destory(obj)
+            return
+
+        await self.perform_destroy(obj)
 
 
 # Mixins for common CRUD operations
+# Runtime mixins inherit from `object` to avoid generic MRO issues, while
+# type checkers still see the full ViewSet API during development.
+if TYPE_CHECKING:
+    _ViewSet = ViewSet
+else:
+    _ViewSet = object
 
 
-class ListMixin:
+class ListMixin(_ViewSet):
     """
     Mixin that provides a list() method for GET requests on collections.
 
     Automatically implements:
-        async def get(self, request) -> list
-
-    Requires:
-        - queryset attribute
-        - serializer_class attribute (optional, returns raw queryset if not provided)
+        async def list(self, request: Request) -> Queryset
     """
 
-    async def get(self, request):
+    async def list(self, request: Request):
         """
-        List all objects in the queryset.
+        List objects in the queryset.
 
         Note: This evaluates the entire queryset. For large datasets,
-        consider implementing pagination or filtering via filter_queryset().
+        consider setting pagination_class or filtering via filter_queryset().
         """
         queryset = await self.get_queryset()
-
-        # Optional: Apply filtering if filter_queryset is available
-        if hasattr(self, "filter_queryset"):
-            queryset = await self.filter_queryset(queryset)
-
-        if hasattr(self, "serializer_class") and self.serializer_class:
-            if hasattr(self, "get_serializer_class"):
-                serializer_class = self.get_serializer_class()
-            else:
-                serializer_class = self.serializer_class
-        else:
-            serializer_class = None
-
-        items = [obj async for obj in queryset]
-        if serializer_class is None:
-            return items
-
-        return await _serialize_many_results(serializer_class, items)
+        queryset = await self._apply_filter_queryset(queryset)
+        return queryset
 
 
-class RetrieveMixin:
+class RetrieveMixin(_ViewSet):
     """
     Mixin that provides a retrieve() method for GET requests on single objects.
 
     Automatically implements:
-        async def get(self, request, pk: int) -> object
-
-    Requires:
-        - queryset attribute
-        - get_object(pk) method
-        - serializer_class attribute (optional, returns raw object if not provided)
+        async def retrieve(self, request: Request) -> object
     """
 
-    async def get(self, request, pk: int):
+    async def retrieve(self, request: Request):
         """Retrieve a single object by primary key."""
-        obj = await self.get_object(pk)
-
-        # If serializer_class is defined, use it
-        if hasattr(self, "serializer_class") and self.serializer_class:
-            # Get serializer class (use method if available, otherwise direct attribute)
-            if hasattr(self, "get_serializer_class"):
-                serializer_class = self.get_serializer_class()
-            else:
-                serializer_class = self.serializer_class
-
-            if hasattr(serializer_class, "afrom_model"):
-                return await serializer_class.afrom_model(obj)
-            else:
-                # Assume it's a msgspec.Struct, use convert
-                fields = getattr(serializer_class, "__annotations__", {})
-                mapped = {name: getattr(obj, name, None) for name in fields}
-                return msgspec.convert(mapped, serializer_class)
-
-        return obj
+        return await self.get_object()
 
 
-class CreateMixin:
+class CreateMixin(_ViewSet):
     """
     Mixin that provides a create() method for POST requests.
 
     Automatically implements:
         async def post(self, request, data: SerializerClass) -> object
-
-    Requires:
-        - queryset attribute (to determine model)
-        - serializer_class attribute (for input validation)
     """
 
-    async def post(self, request, data):
-        """Create a new object."""
-        # Get the model class without evaluating queryset
-        base_qs = self._get_base_queryset()
-        if base_qs is None:
-            raise ValueError(f"'{self.__class__.__name__}' should include a `queryset` attribute.")
-        model = base_qs.model
+    async def create(self, request: Request):
+        """
+        Create a new object.
 
-        # Extract data from msgspec.Struct to dict
-        if hasattr(data, "__struct_fields__"):
-            # It's a msgspec.Struct
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
+        The `data` parameter should be a msgspec.Struct with the fields to create.
+        Uses create_serializer_class if defined, otherwise serializer_class.
+        """
+        serializer_class = self.get_serializer_class("create")
+        validated_obj = serializer_class.model_validate_json(request.body)
 
-        # Create object using async ORM
-        obj = await model.objects.acreate(**data_dict)
+        # Get the model class
+        base_queryset = self._get_base_queryset()
+        model = base_queryset.model if base_queryset is not None else (await self.get_queryset()).model
 
-        # Serialize response
-        if hasattr(self, "serializer_class") and self.serializer_class:
-            # Get serializer class (use method if available, otherwise direct attribute)
-            if hasattr(self, "get_serializer_class"):
-                serializer_class = self.get_serializer_class()
-            else:
-                serializer_class = self.serializer_class
-
-            if hasattr(serializer_class, "afrom_model"):
-                return await serializer_class.afrom_model(obj)
-            else:
-                fields = getattr(serializer_class, "__annotations__", {})
-                mapped = {name: getattr(obj, name, None) for name in fields}
-                return msgspec.convert(mapped, serializer_class)
+        # Create object
+        obj = validated_obj.to_model(model)
+        await self.perform_create(obj)
 
         return obj
 
 
-class UpdateMixin:
+class UpdateMixin(_ViewSet):
     """
     Mixin that provides an update() method for PUT requests.
 
     Automatically implements:
-        async def put(self, request, pk: int, data: SerializerClass) -> object
-
-    Requires:
-        - queryset attribute
-        - get_object(pk) method
-        - serializer_class attribute
+        async def update(self, request, data: SerializerClass) -> object
     """
 
-    async def put(self, request, pk: int, data):
+    async def update(self, request: Request):
         """Update an object (full update)."""
-        obj = await self.get_object(pk)
+        obj = await self.get_object()
 
-        # Extract data from msgspec.Struct to dict
-        if hasattr(data, "__struct_fields__"):
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
+        serializer_class = self.get_serializer_class("update")
+        validated_obj = serializer_class.model_validate_json(request.body)
 
         # Update object fields
-        for key, value in data_dict.items():
-            setattr(obj, key, value)
+        if validated_obj.__struct_config__.omit_defaults:
+            for key, value in validated_obj.to_dict().items():
+                setattr(obj, key, value)
+        else:
+            validated_obj.update_instance(obj)
 
-        # Save using async ORM
-        await obj.asave()
-
-        # Serialize response
-        if hasattr(self, "serializer_class") and self.serializer_class:
-            # Get serializer class (use method if available, otherwise direct attribute)
-            if hasattr(self, "get_serializer_class"):
-                serializer_class = self.get_serializer_class()
-            else:
-                serializer_class = self.serializer_class
-
-            if hasattr(serializer_class, "afrom_model"):
-                return await serializer_class.afrom_model(obj)
-            else:
-                fields = getattr(serializer_class, "__annotations__", {})
-                mapped = {name: getattr(obj, name, None) for name in fields}
-                return msgspec.convert(mapped, serializer_class)
+        # Save object
+        await self.perform_update(obj)
 
         return obj
 
 
-class PartialUpdateMixin:
+class PartialUpdateMixin(_ViewSet):
     """
     Mixin that provides a partial_update() method for PATCH requests.
 
     Automatically implements:
-        async def patch(self, request, pk: int, data: SerializerClass) -> object
-
-    Requires:
-        - queryset attribute
-        - get_object(pk) method
-        - serializer_class attribute
+        async def partial_update(self, request: Request, data: SerializerClass) -> object
     """
 
-    async def patch(self, request, pk: int, data):
+    async def partial_update(self, request: Request):
         """Update an object (partial update)."""
-        obj = await self.get_object(pk)
+        data = decode(request.body)
+        obj = await self.get_object()
 
-        # Extract data from msgspec.Struct to dict
-        if hasattr(data, "__struct_fields__"):
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
+        serializer_class = self.get_serializer_class("update")
+        rename_map = getattr(serializer_class, "__rename_map__", {})
+        input_key_to_field = {field_name: field_name for field_name in serializer_class.__struct_fields__}
+        input_key_to_field.update({alias: field_name for field_name, alias in rename_map.items()})
 
-        # Update only provided fields
-        for key, value in data_dict.items():
-            if value is not None:  # Skip None values in PATCH
-                setattr(obj, key, value)
+        patch_data = {}
+        for key, value in data.items():
+            field_name = input_key_to_field.get(key)
+            if field_name is not None:
+                patch_data[field_name] = value
 
-        # Save using async ORM
-        await obj.asave()
+        if not patch_data:
+            return obj
 
-        # Serialize response
-        if hasattr(self, "serializer_class") and self.serializer_class:
-            # Get serializer class (use method if available, otherwise direct attribute)
-            if hasattr(self, "get_serializer_class"):
-                serializer_class = self.get_serializer_class()
-            else:
-                serializer_class = self.serializer_class
+        current_state = await serializer_class.afrom_model(obj)
+        merged_data = current_state.to_dict()
+        merged_data.update(patch_data)
+        validated_obj = serializer_class.model_validate(merged_data)
 
-            if hasattr(serializer_class, "afrom_model"):
-                return await serializer_class.afrom_model(obj)
-            else:
-                fields = getattr(serializer_class, "__annotations__", {})
-                mapped = {name: getattr(obj, name, None) for name in fields}
-                return msgspec.convert(mapped, serializer_class)
+        # Apply only the patched fields, but use the validated values.
+        for field_name in patch_data:
+            setattr(obj, field_name, getattr(validated_obj, field_name))
+
+        # Save object
+        await self.perform_update(obj)
 
         return obj
 
 
-class DestroyMixin:
+class DestroyMixin(_ViewSet):
     """
     Mixin that provides a destroy() method for DELETE requests.
 
     Automatically implements:
-        async def delete(self, request, pk: int) -> dict
-
-    Requires:
-        - queryset attribute
-        - get_object(pk) method
+        async def delete(self, request: Request)
     """
 
-    async def delete(self, request, pk: int):
+    async def destroy(self, request: Request):
         """Delete an object."""
-        obj = await self.get_object(pk)
+        obj = await self.get_object()
 
-        # Delete using async ORM
-        await obj.adelete()
+        # Delete object
+        await self._perform_destroy(obj)
 
-        # Return success response
-        return {"detail": "Object deleted successfully"}
+        # Return 204 response
+        return None
 
 
 # Convenience ViewSet classes (like Django REST Framework)
 
 
-class ReadOnlyModelViewSet(ViewSet):
+class ReadOnlyModelViewSet(
+    ListMixin,
+    RetrieveMixin,
+    ViewSet,
+):
     """
     A viewset base class for read-only operations.
 
@@ -809,33 +684,25 @@ class ReadOnlyModelViewSet(ViewSet):
     You implement the HTTP method handlers with proper type annotations.
 
     Example:
-        @api.view("/articles")
+        @api.viewset("/articles")
         class ArticleListViewSet(ReadOnlyModelViewSet):
             queryset = Article.objects.all()
             serializer_class = ArticleSchema
-
-            async def get(self, request):
-                \"\"\"List all articles.\"\"\"
-                articles = []
-                async for article in await self.get_queryset():
-                    articles.append(ArticleSchema.from_model(article))
-                return articles
-
-        @api.view("/articles/{pk}")
-        class ArticleDetailViewSet(ReadOnlyModelViewSet):
-            queryset = Article.objects.all()
-            serializer_class = ArticleSchema
-
-            async def get(self, request, pk: int):
-                \"\"\"Retrieve a single article.\"\"\"
-                article = await self.get_object(pk)
-                return ArticleSchema.from_model(article)
+            pagination_class = PageNumberPagination
     """
 
     pass
 
 
-class ModelViewSet(ViewSet):
+class ModelViewSet(
+    ListMixin,
+    RetrieveMixin,
+    CreateMixin,
+    UpdateMixin,
+    PartialUpdateMixin,
+    DestroyMixin,
+    ViewSet,
+):
     """
     A viewset base class that provides helpers for full CRUD operations.
 
@@ -844,22 +711,18 @@ class ModelViewSet(ViewSet):
     implement DRF-style action methods (list, retrieve, create, update, etc.).
 
     Example:
-        from django_bolt import BoltAPI, ModelViewSet
+        from django_bolt import BoltAPI, ModelViewSet, Serializer
+        from django_bolt.serializers import Serializer
         from myapp.models import Article
-        import msgspec
 
         api = BoltAPI()
 
-        class ArticleSchema(msgspec.Struct):
+        class ArticleSchema(Serializer):
             id: int
             title: str
             content: str
 
-            @classmethod
-            def from_model(cls, obj):
-                return cls(id=obj.id, title=obj.title, content=obj.content)
-
-        class ArticleCreateSchema(msgspec.Struct):
+        class ArticleCreateSchema(Serializer):
             title: str
             content: str
 
@@ -867,50 +730,8 @@ class ModelViewSet(ViewSet):
         class ArticleViewSet(ModelViewSet):
             queryset = Article.objects.all()
             serializer_class = ArticleSchema
-
-            async def list(self, request):
-                \"\"\"GET /articles - List all articles.\"\"\"
-                articles = []
-                async for article in await self.get_queryset():
-                    articles.append(ArticleSchema.from_model(article))
-                return articles
-
-            async def retrieve(self, request, pk: int):
-                \"\"\"GET /articles/{pk} - Retrieve a single article.\"\"\"
-                article = await self.get_object(pk=pk)
-                return ArticleSchema.from_model(article)
-
-            async def create(self, request, data: ArticleCreateSchema):
-                \"\"\"POST /articles - Create a new article.\"\"\"
-                article = await Article.objects.acreate(
-                    title=data.title,
-                    content=data.content
-                )
-                return ArticleSchema.from_model(article)
-
-            async def update(self, request, pk: int, data: ArticleCreateSchema):
-                \"\"\"PUT /articles/{pk} - Update an article.\"\"\"
-                article = await self.get_object(pk=pk)
-                article.title = data.title
-                article.content = data.content
-                await article.asave()
-                return ArticleSchema.from_model(article)
-
-            async def partial_update(self, request, pk: int, data: ArticleCreateSchema):
-                \"\"\"PATCH /articles/{pk} - Partially update an article.\"\"\"
-                article = await self.get_object(pk=pk)
-                if data.title:
-                    article.title = data.title
-                if data.content:
-                    article.content = data.content
-                await article.asave()
-                return ArticleSchema.from_model(article)
-
-            async def destroy(self, request, pk: int):
-                \"\"\"DELETE /articles/{pk} - Delete an article.\"\"\"
-                article = await self.get_object(pk=pk)
-                await article.adelete()
-                return {"deleted": True}
+            create_serializer_class = ArticleCreateSchema
+            pagination_class = PageNumberPagination
 
     This provides full CRUD operations with Django ORM integration, just like DRF.
     The difference is that Django-Bolt requires explicit type annotations for
@@ -918,199 +739,4 @@ class ModelViewSet(ViewSet):
     implemented action methods.
     """
 
-    # Optional: separate serializer for create/update operations
-    create_serializer_class: type | None = None
-    update_serializer_class: type | None = None
-
-    async def list(self, request):
-        """
-        List all objects in the queryset.
-
-        Uses list_serializer_class if defined, otherwise serializer_class.
-        Applies filter_queryset() for filtering, searching, ordering.
-        """
-        qs = await self.get_queryset()
-        qs = await self.filter_queryset(qs)  # Apply filtering (still lazy)
-        serializer_class = self.get_serializer_class(action="list")
-
-        items = [obj async for obj in qs]
-        return await _serialize_many_results(serializer_class, items)
-
-    async def retrieve(self, request, **kwargs):
-        """
-        Retrieve a single object by lookup field.
-
-        The lookup field value is passed as a keyword argument (e.g., pk=1, id=1).
-        """
-        # Extract lookup value from kwargs
-        lookup_value = kwargs.get(self.lookup_field)
-        if lookup_value is None:
-            raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
-
-        obj = await self.get_object(**{self.lookup_field: lookup_value})
-        serializer_class = self.get_serializer_class(action="retrieve")
-
-        if hasattr(serializer_class, "afrom_model"):
-            return await serializer_class.afrom_model(obj)
-        else:
-            fields = getattr(serializer_class, "__annotations__", {})
-            mapped = {name: getattr(obj, name, None) for name in fields}
-            return msgspec.convert(mapped, serializer_class)
-
-    async def create(self, request, data):
-        """
-        Create a new object.
-
-        The `data` parameter should be a msgspec.Struct with the fields to create.
-        Uses create_serializer_class if defined, otherwise serializer_class.
-        """
-        # Get the model class without evaluating queryset
-        base_qs = self._get_base_queryset()
-        if base_qs is None:
-            raise ValueError(f"'{self.__class__.__name__}' should include a `queryset` attribute.")
-        model = base_qs.model
-
-        # Extract data from msgspec.Struct
-        if hasattr(data, "__struct_fields__"):
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
-
-        # Create object
-        obj = await model.objects.acreate(**data_dict)
-
-        # Serialize response
-        serializer_class = self.get_serializer_class(action="create")
-        if hasattr(serializer_class, "afrom_model"):
-            return await serializer_class.afrom_model(obj)
-        else:
-            fields = getattr(serializer_class, "__annotations__", {})
-            mapped = {name: getattr(obj, name, None) for name in fields}
-            return msgspec.convert(mapped, serializer_class)
-
-    async def update(self, request, data, **kwargs):
-        """
-        Update an object (full update).
-
-        The lookup field value is passed as a keyword argument.
-        Uses update_serializer_class if defined, otherwise create_serializer_class or serializer_class.
-        """
-        lookup_value = kwargs.get(self.lookup_field)
-        if lookup_value is None:
-            raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
-
-        obj = await self.get_object(**{self.lookup_field: lookup_value})
-
-        # Extract data
-        if hasattr(data, "__struct_fields__"):
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
-
-        # Update all fields
-        for key, value in data_dict.items():
-            setattr(obj, key, value)
-
-        await obj.asave()
-
-        # Serialize response
-        serializer_class = self.get_serializer_class(action="update")
-        if hasattr(serializer_class, "afrom_model"):
-            return await serializer_class.afrom_model(obj)
-        else:
-            fields = getattr(serializer_class, "__annotations__", {})
-            mapped = {name: getattr(obj, name, None) for name in fields}
-            return msgspec.convert(mapped, serializer_class)
-
-    async def partial_update(self, request, data, **kwargs):
-        """
-        Partially update an object.
-
-        Only updates fields that are not None in the data.
-        """
-        lookup_value = kwargs.get(self.lookup_field)
-        if lookup_value is None:
-            raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
-
-        obj = await self.get_object(**{self.lookup_field: lookup_value})
-
-        # Extract data
-        if hasattr(data, "__struct_fields__"):
-            fields = data.__struct_fields__
-            data_dict = {field: getattr(data, field) for field in fields}
-        elif isinstance(data, dict):
-            data_dict = data
-        else:
-            raise ValueError(f"Cannot extract data from {type(data)}")
-
-        # Update only non-None fields
-        for key, value in data_dict.items():
-            if value is not None:
-                setattr(obj, key, value)
-
-        await obj.asave()
-
-        # Serialize response
-        serializer_class = self.get_serializer_class(action="partial_update")
-        if hasattr(serializer_class, "afrom_model"):
-            return await serializer_class.afrom_model(obj)
-        else:
-            fields = getattr(serializer_class, "__annotations__", {})
-            mapped = {name: getattr(obj, name, None) for name in fields}
-            return msgspec.convert(mapped, serializer_class)
-
-    async def destroy(self, request, **kwargs):
-        """
-        Delete an object.
-        """
-        lookup_value = kwargs.get(self.lookup_field)
-        if lookup_value is None:
-            raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
-
-        obj = await self.get_object(**{self.lookup_field: lookup_value})
-        await obj.adelete()
-
-        return {"deleted": True}
-
-    def get_serializer_class(self, action: str | None = None):
-        """
-        Get the serializer class for this viewset.
-
-        Supports action-specific serializer classes:
-        - list: list_serializer_class or serializer_class
-        - create: create_serializer_class or serializer_class
-        - update/partial_update: update_serializer_class or create_serializer_class or serializer_class
-        - retrieve/destroy: serializer_class
-
-        Args:
-            action: The action being performed ('list', 'retrieve', 'create', etc.)
-
-        Returns:
-            Serializer class
-        """
-        if action is None:
-            action = self.action
-
-        # Action-specific serializer classes
-        if action == "list" and self.list_serializer_class is not None:
-            return self.list_serializer_class
-        elif action == "create" and self.create_serializer_class is not None:
-            return self.create_serializer_class
-        elif action in ("update", "partial_update"):
-            if self.update_serializer_class is not None:
-                return self.update_serializer_class
-            elif self.create_serializer_class is not None:
-                return self.create_serializer_class
-
-        if self.serializer_class is None:
-            raise ValueError(
-                f"'{self.__class__.__name__}' should either include a `serializer_class` attribute, "
-                f"or override the `get_serializer_class()` method."
-            )
-        return self.serializer_class
+    pass

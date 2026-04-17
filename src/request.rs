@@ -160,6 +160,17 @@ impl PyRequest {
         Self::dict_or_empty(&self.query_params, py)
     }
 
+    /// Get path params as a dict.
+    /// Values are pre-typed by Rust (int, float, bool, str).
+    ///
+    /// Example:
+    ///     id_ = request.params.get("id", 1)
+    #[getter]
+    #[inline]
+    fn params<'py>(&self, py: Python<'py>) -> Py<PyDict> {
+        Self::dict_or_empty(&self.path_params, py)
+    }
+
     /// Get the state dict for middleware to store arbitrary data.
     ///
     /// This follows the Starlette pattern where middleware can store

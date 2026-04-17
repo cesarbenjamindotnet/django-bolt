@@ -8,6 +8,7 @@ or return type annotation for efficient batch serialization.
 from __future__ import annotations
 
 import asyncio
+import builtins
 
 import msgspec
 import pytest
@@ -234,6 +235,34 @@ def test_paginate_with_return_type_annotation(sample_articles):
         assert "author" in first_item
         assert "content" not in first_item
         assert "is_published" not in first_item
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginate_with_flat_serializer_uses_sync_from_model(sample_articles, monkeypatch):
+    """Flat serializers should avoid the async afrom_model() path during pagination."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 10
+
+    async def fail_afrom_model(cls, instance, *, _depth=0, max_depth=10):
+        raise AssertionError("flat pagination should not call afrom_model()")
+
+    monkeypatch.setattr(
+        ArticleListSerializer,
+        "afrom_model",
+        classmethod(fail_afrom_model),
+    )
+
+    @api.get("/articles", response_model=list[ArticleListSerializer])
+    @paginate(SmallPagePagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get("/articles?page=1")
+        assert response.status_code == 200
+        assert len(response.json()["items"]) == 10
 
 
 @pytest.mark.django_db(transaction=True)
@@ -596,7 +625,7 @@ def test_viewset_pagination_with_return_type_serializer(sample_articles):
         queryset = Article.objects.all()
 
         @paginate(SmallPagePagination)
-        async def list(self, request) -> list[ArticleListSerializer]:
+        async def list(self, request) -> builtins.list[ArticleListSerializer]:
             return await self.get_queryset()
 
     with TestClient(api) as client:
