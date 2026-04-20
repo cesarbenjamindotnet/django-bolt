@@ -154,6 +154,14 @@ class SchemaGenerator:
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
 
+            # 🔥 REGISTRAR create_serializer_class
+            view_cls = getattr(handler, "__self__", None)
+
+            if view_cls:
+                create_ser = getattr(view_cls.__class__, "create_serializer_class", None)
+                if create_ser:
+                    self._type_to_schema(create_ser, register_component=True)
+
             # Create operation
             operation = self._create_operation(
                 handler=handler,
