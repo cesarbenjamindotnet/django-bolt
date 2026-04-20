@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import enum
 import http.client
 import inspect
@@ -36,6 +37,8 @@ _SCHEME_NAME_MAP: dict[str, str] = {
     "api_key": "ApiKeyAuth",
 }
 
+def _extract_path_params(path: str):
+    return re.findall(r"{(.*?)}", path)
 
 class SchemaGenerator:
     """Generate OpenAPI schema from BoltAPI routes."""
@@ -159,6 +162,26 @@ class SchemaGenerator:
                 meta=meta,
                 handler_id=handler_id,
             )
+
+            # 🔥 FIX: agregar path params automáticamente
+            path_params = _extract_path_params(path)
+
+            if path_params:
+                if operation.parameters is None:
+                    operation.parameters = []
+
+                existing = {p.name for p in operation.parameters}
+
+                for p in path_params:
+                    if p not in existing:
+                        operation.parameters.append(
+                            Parameter(
+                                name=p,
+                                param_in="path",
+                                required=True,
+                                schema=Schema(type="string"),
+                            )
+                        )
 
             # Collect tags from operation
             if operation.tags:
@@ -286,6 +309,25 @@ class SchemaGenerator:
             tags=tags,
             operation_id=f"{method.lower()}_{handler.__name__}",
         )
+
+        if method in ["POST", "PUT", "PATCH"]:
+            schema_name = None
+
+            if method == "POST" and hasattr(self.api, "create_serializer_class"):
+                schema_name = f"{handler.__qualname__}Create"
+            else:
+                schema_name = f"{handler.__qualname__}"
+
+            operation.request_body = {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "$ref": f"#/components/schemas/{schema_name}"
+                        }
+                    }
+                }
+            }
 
         return operation
 
