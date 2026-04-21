@@ -165,9 +165,6 @@ class SchemaGenerator:
                 handler_id=handler_id,
             )
 
-            print("META KEYS:", meta.keys())
-            print("REQUEST SERIALIZER:", meta.get("request_serializer_class"))
-
             if method in ["POST", "PUT", "PATCH"]:
                 serializer_cls = meta.get("request_serializer_class")
 
