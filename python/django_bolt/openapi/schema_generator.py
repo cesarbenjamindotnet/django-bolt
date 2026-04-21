@@ -37,8 +37,10 @@ _SCHEME_NAME_MAP: dict[str, str] = {
     "api_key": "ApiKeyAuth",
 }
 
+
 def _extract_path_params(path: str):
     return re.findall(r"{(.*?)}", path)
+
 
 class SchemaGenerator:
     """Generate OpenAPI schema from BoltAPI routes."""
@@ -154,14 +156,6 @@ class SchemaGenerator:
             # Get handler metadata
             meta = self.api._handler_meta.get(handler_id, {})
 
-            # 🔥 REGISTRAR create_serializer_class
-            view_cls = getattr(handler, "__self__", None)
-
-            if view_cls:
-                create_ser = getattr(view_cls.__class__, "create_serializer_class", None)
-                if create_ser:
-                    self._type_to_schema(create_ser, register_component=True)
-
             # Create operation
             operation = self._create_operation(
                 handler=handler,
@@ -170,6 +164,28 @@ class SchemaGenerator:
                 meta=meta,
                 handler_id=handler_id,
             )
+
+            print("META KEYS:", meta.keys())
+            print("REQUEST SERIALIZER:", meta.get("request_serializer_class"))
+
+            if method in ["POST", "PUT", "PATCH"]:
+                serializer_cls = meta.get("request_serializer_class")
+
+                if isinstance(serializer_cls, type):
+                    schema_name = serializer_cls.__name__
+
+                    self._type_to_schema(serializer_cls, register_component=True)
+
+                    operation.request_body = {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": f"#/components/schemas/{schema_name}"
+                                }
+                            }
+                        }
+                    }
 
             # 🔥 FIX: agregar path params automáticamente
             path_params = _extract_path_params(path)
@@ -317,25 +333,6 @@ class SchemaGenerator:
             tags=tags,
             operation_id=f"{method.lower()}_{handler.__name__}",
         )
-
-        if method in ["POST", "PUT", "PATCH"]:
-            schema_name = None
-
-            if method == "POST" and hasattr(self.api, "create_serializer_class"):
-                schema_name = f"{handler.__qualname__}Create"
-            else:
-                schema_name = f"{handler.__qualname__}"
-
-            operation.request_body = {
-                "required": True,
-                "content": {
-                    "application/json": {
-                        "schema": {
-                            "$ref": f"#/components/schemas/{schema_name}"
-                        }
-                    }
-                }
-            }
 
         return operation
 

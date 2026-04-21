@@ -153,6 +153,17 @@ class APIView:
         view_handler.__signature__ = new_sig
         view_handler.__annotations__ = {k: v for k, v in inspect.get_annotations(method_handler).items() if k != "self"}
 
+        view_handler.__bolt_viewset_class__ = cls
+        view_handler.__bolt_action_name__ = action_name
+
+        if hasattr(cls, "_get_default_serializer_class"):
+            try:
+                view_handler.__bolt_request_serializer_class__ = cls._get_default_serializer_class(action_name)
+            except Exception:
+                view_handler.__bolt_request_serializer_class__ = None
+        else:
+            view_handler.__bolt_request_serializer_class__ = None
+
         # Preserve docstring and name
         view_handler.__name__ = f"{cls.__name__}.{action_name}"
         view_handler.__doc__ = method_handler.__doc__

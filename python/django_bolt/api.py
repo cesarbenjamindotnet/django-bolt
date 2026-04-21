@@ -963,6 +963,11 @@ class BoltAPI:
                 # Use action name (e.g., "list") not HTTP method name (e.g., "get")
                 handler = viewset_cls.as_view(http_method.lower(), action=action_name)
 
+                if action_name == "create":
+                    handler.__bolt_request_serializer_class__ = getattr(viewset_cls, "create_serializer_class", None)
+                else:
+                    handler.__bolt_request_serializer_class__ = getattr(viewset_cls, "serializer_class", None)
+
                 # Merge guards and auth
                 merged_guards = guards
                 if merged_guards is None and hasattr(handler, "__bolt_guards__"):
@@ -1412,6 +1417,15 @@ class BoltAPI:
             meta["injector_is_async"] = inspect.iscoroutinefunction(injector)
             meta["_original_fn"] = fn
             meta["_handler_executor"] = self._compile_handler_executor(meta)
+
+            if hasattr(fn, "__bolt_request_serializer_class__"):
+                meta["request_serializer_class"] = fn.__bolt_request_serializer_class__
+
+            if hasattr(fn, "__bolt_viewset_class__"):
+                meta["viewset_class"] = fn.__bolt_viewset_class__
+
+            if hasattr(fn, "__bolt_action_name__"):
+                meta["action_name"] = fn.__bolt_action_name__
 
             # Normalize route-level middleware declared via @middleware / @cors / @rate_limit.
             # Validation happens at registration time to fail fast and deterministically.
