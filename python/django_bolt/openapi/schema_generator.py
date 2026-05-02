@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 
+from ..datastructures import UploadFile
 from ..serializers.fields import _FieldMarker
-from ..typing import is_msgspec_struct, is_optional
+from ..typing import is_msgspec_struct, is_optional, unwrap_optional
 from .spec import (
     OpenAPI,
+    OpenAPIHeader,
     OpenAPIMediaType,
     OpenAPIResponse,
     Operation,
@@ -409,19 +411,20 @@ class SchemaGenerator:
         parameters.extend(upgrade_headers)
 
         # WebSocket endpoints don't have traditional HTTP responses
-        # Document the 101 Switching Protocols response
+        # Document the 101 Switching Protocols response.
+        # Per OpenAPI 3.1 the Header Object MUST NOT specify `name` or
+        # `in` — both are derived from the `headers` map key + the
+        # implicit `header` location — so use `OpenAPIHeader` (which
+        # excludes those fields on serialization) rather than
+        # `Parameter`. Validators reject the latter.
         responses = {
             "101": OpenAPIResponse(
                 description="Switching Protocols - WebSocket connection established",
                 headers={
-                    "Upgrade": Parameter(
-                        name="Upgrade",
-                        param_in="header",
+                    "Upgrade": OpenAPIHeader(
                         schema=Schema(type="string", enum=["websocket"]),
                     ),
-                    "Connection": Parameter(
-                        name="Connection",
-                        param_in="header",
+                    "Connection": OpenAPIHeader(
                         schema=Schema(type="string", enum=["Upgrade"]),
                     ),
                 },
@@ -556,23 +559,31 @@ class SchemaGenerator:
 
             if form_fields:
                 # Multipart form data
-                properties = {}
-                required = []
+                properties: dict[str, Schema | Reference] = {}
+                required: list[str] = []
                 for field in form_fields:
-                    # Access FieldDefinition attributes directly
                     name = field.alias or field.name
                     annotation = field.annotation
                     default = field.default
-                    source = field.source
 
-                    if source == "file":
-                        # File upload
-                        schema = Schema(type="string", format="binary")
-                    else:
-                        schema = self._type_to_schema(annotation)
+                    # Form fields annotated with a Struct/Serializer are flattened:
+                    # the runtime form extractor reads each struct field as a
+                    # top-level form key, so the schema must mirror that shape.
+                    # Use msgspec.structs.fields (raw Python types) rather than
+                    # msgspec.inspect.type_info (CustomType-wrapped) so the
+                    # UploadFile branch in _type_to_schema fires for file fields.
+                    unwrapped = unwrap_optional(annotation)
+                    if is_msgspec_struct(unwrapped):
+                        for struct_field in msgspec.structs.fields(unwrapped):
+                            sub_name, sub_schema, sub_required = self._msgspec_field_schema(
+                                struct_field, register_component=False
+                            )
+                            properties[sub_name] = sub_schema
+                            if sub_required:
+                                required.append(sub_name)
+                        continue
 
-                    properties[name] = schema
-
+                    properties[name] = self._type_to_schema(annotation)
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 
@@ -903,20 +914,31 @@ class SchemaGenerator:
                 # msgspec.inspect UnionType — the .types attr distinguishes
                 # this from Python's built-in types.UnionType (which uses
                 # .__args__ instead).
-                non_none_types = [
-                    t
-                    for t in type_annotation.types
-                    # String comparison because msgspec.inspect.NoneType is
-                    # not the same object as builtins.NoneType.
-                    if type(t).__name__ != "NoneType"
-                ]
-                if len(non_none_types) == 1:
-                    return self._type_to_schema(non_none_types[0], register_component=register_component)
-                if len(non_none_types) > 1:
-                    return Schema(
-                        any_of=[self._type_to_schema(t, register_component=register_component) for t in non_none_types]
-                    )
-                return Schema(type="object")
+                #
+                # String comparison: msgspec.inspect.NoneType is not the
+                # same object as builtins.NoneType.
+                types = list(type_annotation.types)
+                non_none_types = [t for t in types if type(t).__name__ != "NoneType"]
+                has_none = len(non_none_types) != len(types)
+
+                if not non_none_types:
+                    # `None`-only union (rare; e.g. Optional[NoneType])
+                    return Schema(type="null") if has_none else Schema(type="object")
+
+                inner_schemas = [self._type_to_schema(t, register_component=register_component) for t in non_none_types]
+                # Per OpenAPI 3.1 (the version this generator declares),
+                # nullable fields are expressed via `null` in the type
+                # union — not the legacy 3.0 `nullable: true`. Preserving
+                # None here means generated specs round-trip correctly
+                # through tooling like openapi-typescript, which uses the
+                # spec verbatim and would otherwise lose the `| null` arm
+                # of the generated TS type.
+                if has_none:
+                    inner_schemas.append(Schema(type="null"))
+
+                if len(inner_schemas) == 1:
+                    return inner_schemas[0]
+                return Schema(any_of=inner_schemas)
             if type_name == "ListType":
                 item_type = getattr(type_annotation, "item_type", None)
                 if item_type:
@@ -960,6 +982,11 @@ class SchemaGenerator:
                 type_annotation = non_none_args[0]
                 origin = get_origin(type_annotation)
                 args = get_args(type_annotation)
+
+        # Handle UploadFile — list[UploadFile] flows through the list branch
+        # below and recurses back into this check for the item type.
+        if type_annotation is UploadFile:
+            return Schema(type="string", format="binary")
 
         # Handle msgspec.Struct
         if is_msgspec_struct(type_annotation):
